@@ -1,0 +1,9 @@
+/Gemfile.lock
+/pkg/
+/coverage/
+/target/
+/lib/**/*.so
+/lib/**/*.bundle
+/lib/**/*.dylib
+/tmp/
+*.gem
