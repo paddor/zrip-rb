@@ -4,7 +4,7 @@ require_relative "zrip/zrip"        # Rust extension
 require_relative "zrip/version"
 
 module Zrip
-  DEFAULT_LEVEL = 3
+  DEFAULT_LEVEL = 1
 end
 
 require_relative "zrip/dictionary"

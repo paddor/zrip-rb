@@ -15,7 +15,7 @@ declared Ractor-safe so you can compress from any Ractor without a global lock.
 - **Block codec** with per-Ractor context (no lock overhead)
 - **Dictionary support** for both frame and block codecs
 - **FastCOVER-based dictionary trainer** (`DictTrainer`)
-- **Configurable compression levels** (default: 3)
+- **Configurable compression levels** (default: 1)
 - **Bounded decompression** with `max_output_size:` and frame content size checks
 - **Ractor-safe**: `FrameCodec` is shareable across Ractors, `BlockCodec` is
   per-Ractor (mutable context state)
@@ -115,7 +115,7 @@ ractors.each { |r| p r.value }  # => :ok, :ok, :ok, :ok
 
 | Class / Module | Method | Description |
 |---|---|---|
-| `Zrip::FrameCodec` | `.new(dict: nil, level: 3)` | Create a frame codec, optionally with a `Dictionary`, raw `String` dict, or compression level |
+| `Zrip::FrameCodec` | `.new(dict: nil, level: 1)` | Create a frame codec, optionally with a `Dictionary`, raw `String` dict, or compression level |
 | | `.get_frame_content_size(string)` | Read Frame_Content_Size from a Zstd frame header |
 | | `#compress(string)` | Compress to Zstd frame |
 | | `#decompress(string, max_output_size: nil)` | Decompress a Zstd frame, optionally bounded |
@@ -123,7 +123,7 @@ ractors.each { |r| p r.value }  # => :ok, :ok, :ok, :ok
 | | `#id` | Dictionary ID (nil without dict) |
 | | `#size` | Dictionary size in bytes (0 without dict) |
 | | `#level` | Compression level |
-| `Zrip::BlockCodec` | `.new(dict: nil, level: 3)` | Create a block codec, optionally with a dict |
+| `Zrip::BlockCodec` | `.new(dict: nil, level: 1)` | Create a block codec, optionally with a dict |
 | | `#compress(string)` | Compress to Zstd block |
 | | `#decompress(string, max_output_size: nil)` | Decompress a Zstd block, optionally bounded |
 | | `#has_dict?` | Whether a dictionary is loaded |
