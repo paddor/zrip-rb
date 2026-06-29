@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-29
+
+- Update `zrip` crate dependency from 0.3 to 0.8.
+
 ## [0.1.0] - 2026-06-20
 
 - Initial release.
