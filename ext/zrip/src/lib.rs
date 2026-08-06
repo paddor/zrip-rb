@@ -1,8 +1,11 @@
 use magnus::{
-    exception::ExceptionClass, function, method, prelude::*, r_string::RString, value::Opaque,
-    Error, Ruby,
+    exception::ExceptionClass, function, method, prelude::*, r_string::RString, rb_sys::AsRawValue,
+    value::Opaque, Error, Ruby,
 };
 use std::cell::RefCell;
+use std::ffi::c_void;
+use std::mem::MaybeUninit;
+use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
 use zstd::dict::fastcover::FastCoverParams;
@@ -12,6 +15,93 @@ static DECOMPRESS_ERROR: OnceLock<Opaque<ExceptionClass>> = OnceLock::new();
 static COMPRESS_ERROR: OnceLock<Opaque<ExceptionClass>> = OnceLock::new();
 static MISSING_CONTENT_SIZE_ERROR: OnceLock<Opaque<ExceptionClass>> = OnceLock::new();
 static OUTPUT_SIZE_LIMIT_ERROR: OnceLock<Opaque<ExceptionClass>> = OnceLock::new();
+const GVL_COMPRESS_THRESHOLD: usize = 64 * 1024;
+const GVL_FRAME_DECOMPRESS_THRESHOLD: usize = 64 * 1024;
+
+type RbWithoutGvlFunc = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+type RbUnblockFunc = unsafe extern "C" fn(*mut c_void);
+
+unsafe extern "C" {
+    fn rb_thread_call_without_gvl(
+        func: Option<RbWithoutGvlFunc>,
+        data1: *mut c_void,
+        ubf: Option<RbUnblockFunc>,
+        data2: *mut c_void,
+    ) -> *mut c_void;
+    fn rb_str_locktmp(str: rb_sys::VALUE) -> rb_sys::VALUE;
+    fn rb_str_unlocktmp(str: rb_sys::VALUE) -> rb_sys::VALUE;
+}
+
+fn should_release_compress_gvl(input_len: usize) -> bool {
+    input_len >= GVL_COMPRESS_THRESHOLD
+}
+
+fn should_release_frame_decompress_gvl(output_len: usize) -> bool {
+    output_len >= GVL_FRAME_DECOMPRESS_THRESHOLD
+}
+
+struct WithoutGvlData<F, R> {
+    func: Option<F>,
+    output: MaybeUninit<R>,
+}
+
+unsafe extern "C" fn without_gvl_trampoline<F, R>(data: *mut c_void) -> *mut c_void
+where
+    F: FnOnce() -> R,
+{
+    let data = unsafe { &mut *(data.cast::<WithoutGvlData<F, R>>()) };
+    let func = data.func.take().expect("missing without-GVL function");
+    data.output.write(func());
+    ptr::null_mut()
+}
+
+fn without_gvl<F, R>(func: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let mut data = WithoutGvlData {
+        func: Some(func),
+        output: MaybeUninit::uninit(),
+    };
+    unsafe {
+        rb_thread_call_without_gvl(
+            Some(without_gvl_trampoline::<F, R>),
+            (&mut data as *mut WithoutGvlData<F, R>).cast::<c_void>(),
+            None,
+            ptr::null_mut(),
+        );
+        data.output.assume_init()
+    }
+}
+
+struct RStringLock {
+    raw: rb_sys::VALUE,
+    locked: bool,
+}
+
+impl RStringLock {
+    fn new(s: RString) -> Self {
+        let locked = !s.is_frozen();
+        let raw = s.as_raw();
+        if locked {
+            unsafe {
+                rb_str_locktmp(raw);
+            }
+        }
+        Self { raw, locked }
+    }
+}
+
+impl Drop for RStringLock {
+    fn drop(&mut self) {
+        if self.locked {
+            unsafe {
+                rb_str_unlocktmp(self.raw);
+            }
+        }
+        let _ = rb_sys::rb_gc_guard!(self.raw);
+    }
+}
 
 fn decompress_error(ruby: &Ruby) -> ExceptionClass {
     ruby.get_inner(
@@ -138,6 +228,14 @@ fn decompress_bounded(
     Ok(result.into_owned())
 }
 
+fn decompress_work_size(compressed: &[u8], max_output: usize) -> usize {
+    match parse_frame_content_size(compressed) {
+        Ok(Some(n)) => usize::try_from(n).unwrap_or(usize::MAX),
+        Ok(None) if max_output != 0 => max_output,
+        _ => compressed.len(),
+    }
+}
+
 fn raise_bounded(ruby: &Ruby, err: BoundedError, prefix: &str) -> Error {
     match err {
         BoundedError::BadMagic => Error::new(
@@ -229,11 +327,16 @@ fn frame_codec_compress(
     rb_self: &FrameCodec,
     rb_input: RString,
 ) -> Result<RString, Error> {
+    let release_gvl = should_release_compress_gvl(rb_input.len());
+    let _input_lock = release_gvl.then(|| RStringLock::new(rb_input));
     let input: &[u8] = unsafe { rb_input.as_slice() };
     let mut cctx = rb_self.cctx.lock().expect("FrameCodec CCtx mutex poisoned");
-    let out = cctx
-        .compress(input)
-        .map_err(|e| Error::new(compress_error(ruby), format!("zstd compress failed: {e}")))?;
+    let out = if release_gvl {
+        without_gvl(|| cctx.compress(input))
+    } else {
+        cctx.compress(input)
+    }
+    .map_err(|e| Error::new(compress_error(ruby), format!("zstd compress failed: {e}")))?;
     Ok(ruby.str_from_slice(&out))
 }
 
@@ -244,9 +347,16 @@ fn frame_codec_decompress(
     max_output: usize,
 ) -> Result<RString, Error> {
     let compressed: &[u8] = unsafe { rb_input.as_slice() };
+    let release_gvl =
+        should_release_frame_decompress_gvl(decompress_work_size(compressed, max_output));
+    let _input_lock = release_gvl.then(|| RStringLock::new(rb_input));
     let mut dctx = rb_self.dctx.lock().expect("FrameCodec DCtx mutex poisoned");
-    let out = decompress_bounded(compressed, max_output, &mut dctx)
-        .map_err(|e| raise_bounded(ruby, e, "zstd frame decode failed"))?;
+    let out = if release_gvl {
+        without_gvl(|| decompress_bounded(compressed, max_output, &mut dctx))
+    } else {
+        decompress_bounded(compressed, max_output, &mut dctx)
+    }
+    .map_err(|e| raise_bounded(ruby, e, "zstd frame decode failed"))?;
     Ok(ruby.str_from_slice(&out))
 }
 
@@ -337,11 +447,16 @@ fn block_codec_compress(
     rb_self: &BlockCodec,
     rb_input: RString,
 ) -> Result<RString, Error> {
+    let release_gvl = should_release_compress_gvl(rb_input.len());
+    let _input_lock = release_gvl.then(|| RStringLock::new(rb_input));
     let input: &[u8] = unsafe { rb_input.as_slice() };
     let mut cctx = rb_self.cctx.borrow_mut();
-    let out = cctx
-        .compress(input)
-        .map_err(|e| Error::new(compress_error(ruby), format!("zstd compress failed: {e}")))?;
+    let out = if release_gvl {
+        without_gvl(|| cctx.compress(input))
+    } else {
+        cctx.compress(input)
+    }
+    .map_err(|e| Error::new(compress_error(ruby), format!("zstd compress failed: {e}")))?;
     Ok(ruby.str_from_slice(&out))
 }
 

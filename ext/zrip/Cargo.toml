@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 zstd   = { version = "0.8.4", package = "zrip", features = ["frame", "dict_builder"] }
-magnus = "0.8"
+magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = "0.9"
 
 [build-dependencies]

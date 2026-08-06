@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Release the Ruby GVL around large frame/block compression and frame
+  decompression calls.
+
 ## [0.1.2] - 2026-08-05
 
 - Update `zrip` crate dependency from 0.8.3 to 0.8.4.
