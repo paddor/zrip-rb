@@ -4,6 +4,8 @@
 
 - Release the Ruby GVL around large frame/block compression and frame
   decompression calls.
+- Apply `max_output_size:` to the total decompressed output of concatenated
+  Zstandard frames.
 
 ## [0.1.2] - 2026-08-05
 
