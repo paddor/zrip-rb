@@ -2,6 +2,7 @@
 name    = "zrip"
 version = "0.1.2"
 edition = "2021"
+build   = "build.rs"
 
 [lib]
 name       = "zrip"
@@ -9,7 +10,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 zstd   = { version = "0.8.4", package = "zrip", features = ["frame", "dict_builder"] }
-magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = "0.9"
 
 [build-dependencies]
