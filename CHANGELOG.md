@@ -4,6 +4,8 @@
 
 - Release the Ruby GVL around large frame/block compression and frame
   decompression calls.
+- Replace Magnus with direct `rb-sys` bindings, add TruffleRuby build support,
+  and lower the Ruby requirement to 3.4.
 - Apply `max_output_size:` to the total decompressed output of concatenated
   Zstandard frames.
 - Add RubyDoc metadata and move API reference details from `README.md` into

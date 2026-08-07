@@ -8,7 +8,7 @@ Gem::Specification.new do |s|
   s.authors  = ["Patrik Wenger"]
   s.email    = ["paddor@gmail.com"]
   s.summary  = "Ractor-safe Zstandard bindings for Ruby (pure-Rust zrip backend)"
-  s.description = "Ruby bindings (via Rust/magnus) for zrip, a pure-Rust " \
+  s.description = "Ruby bindings (via Rust/rb-sys) for zrip, a pure-Rust " \
                   "Zstandard implementation. Frame-format and block-format " \
                   "compress/decompress with optional dictionary support, " \
                   "configurable compression levels, and FastCOVER-based " \
@@ -16,7 +16,7 @@ Gem::Specification.new do |s|
   s.homepage = "https://github.com/paddor/zrip-rb"
   s.license  = "MIT"
 
-  s.required_ruby_version = ">= 4.0.0"
+  s.required_ruby_version = ">= 3.4.0"
 
   s.metadata["homepage_uri"]      = s.homepage
   s.metadata["source_code_uri"]   = s.homepage

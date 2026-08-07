@@ -7,3 +7,4 @@ gemspec
 gem "minitest"
 gem "rake"
 gem "rake-compiler"
+gem "ruby_memcheck", require: false, platforms: :mri

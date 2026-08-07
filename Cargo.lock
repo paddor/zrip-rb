@@ -111,29 +111,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "magnus"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b36a5b126bbe97eb0d02d07acfeb327036c6319fd816139a49824a83b7f9012"
-dependencies = [
- "magnus-macros",
- "rb-sys",
- "rb-sys-env",
- "seq-macro",
-]
-
-[[package]]
-name = "magnus-macros"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47607461fd8e1513cb4f2076c197d8092d921a1ea75bd08af97398f593751892"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -198,12 +175,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rb-sys-env"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca7ad6a7e21e72151d56fe2495a259b5670e204c3adac41ee7ef676ea08117a"
-
-[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -237,12 +208,6 @@ name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
-
-[[package]]
-name = "seq-macro"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bc711410fbe7399f390ca1c3b60ad0f53f80e95c5eb935e52268a0e2cd49acc"
 
 [[package]]
 name = "shell-words"
@@ -283,16 +248,15 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 name = "zrip"
 version = "0.1.2"
 dependencies = [
- "magnus",
  "rb-sys",
- "zrip 0.8.4",
+ "zrip 0.8.5",
 ]
 
 [[package]]
 name = "zrip"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d6514da35b51d81bfc515782396980ac909fe46925fd19701b36329ddec46e8"
+checksum = "fa05c09787b3aaaaa57870dca9fd9f3b4934018cbb5dde1b112017e2e70ec491"
 dependencies = [
  "zrip-core",
  "zrip-decode",
@@ -307,9 +271,9 @@ checksum = "9335acd94c1f09f729178fc339f9d49790254c1e98ba076f88df3a3f534c4e7d"
 
 [[package]]
 name = "zrip-decode"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16c26a2ea54a97d013b6f2a430b659fb77e0d5feb0aa3f80cb8c141d6827beba"
+checksum = "1801cd8b5d374e2bc31cd8a231182dd47e621492fa0bf68ca7d3033e001cd06b"
 dependencies = [
  "fearless_simd",
  "zrip-core",
