@@ -18,6 +18,7 @@ static OUTPUT_SIZE_LIMIT_ERROR: OnceLock<GlobalValue> = OnceLock::new();
 
 const GVL_COMPRESS_THRESHOLD: usize = 64 * 1024;
 const GVL_FRAME_DECOMPRESS_THRESHOLD: usize = 64 * 1024;
+const DECOMPRESS_READ_CHUNK: usize = 16 * 1024;
 
 #[derive(Copy, Clone)]
 struct GlobalValue(VALUE);
@@ -132,6 +133,50 @@ fn parse_frame_content_size(input: &[u8]) -> Result<Option<u64>, BoundedError> {
     Ok(Some(value))
 }
 
+fn io_error_is_output_too_small(err: &std::io::Error) -> bool {
+    matches!(
+        err.get_ref()
+            .and_then(|inner| inner.downcast_ref::<zstd::error::DecompressError>()),
+        Some(zstd::error::DecompressError::OutputTooSmall)
+    )
+}
+
+fn read_decoder_bounded<R: Read>(
+    decoder: &mut R,
+    max_output: usize,
+) -> Result<Vec<u8>, BoundedError> {
+    let mut output = Vec::new();
+    let mut buf = [0u8; DECOMPRESS_READ_CHUNK];
+
+    loop {
+        let n = decoder.read(&mut buf).map_err(|e| {
+            if io_error_is_output_too_small(&e) {
+                BoundedError::OutputSizeLimit {
+                    limit: max_output as u64,
+                }
+            } else {
+                BoundedError::DecoderFailed(format!("{e}"))
+            }
+        })?;
+        if n == 0 {
+            return Ok(output);
+        }
+
+        let Some(next_len) = output.len().checked_add(n) else {
+            return Err(BoundedError::OutputSizeLimit {
+                limit: max_output as u64,
+            });
+        };
+        if next_len > max_output {
+            return Err(BoundedError::OutputSizeLimit {
+                limit: max_output as u64,
+            });
+        }
+
+        output.extend_from_slice(&buf[..n]);
+    }
+}
+
 fn decompress_bounded(
     compressed: &[u8],
     max_output: usize,
@@ -149,25 +194,11 @@ fn decompress_bounded(
     } else {
         let mut decoder = match dict {
             Some(dict) => {
-                zstd::FrameDecoder::with_dict_and_limit(compressed, dict.clone(), max_output)
+                zstd::FrameDecoder::with_dict_and_limit(compressed, dict.clone(), usize::MAX)
             }
-            None => zstd::FrameDecoder::with_limit(compressed, max_output),
+            None => zstd::FrameDecoder::with_limit(compressed, usize::MAX),
         };
-        let mut output = Vec::new();
-        decoder.read_to_end(&mut output).map_err(|e| {
-            match e
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<zstd::error::DecompressError>())
-            {
-                Some(zstd::error::DecompressError::OutputTooSmall) => {
-                    BoundedError::OutputSizeLimit {
-                        limit: max_output as u64,
-                    }
-                }
-                _ => BoundedError::DecoderFailed(format!("{e}")),
-            }
-        })?;
-        output
+        read_decoder_bounded(&mut decoder, max_output)?
     };
 
     Ok(result)

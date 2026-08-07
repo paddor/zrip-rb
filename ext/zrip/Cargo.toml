@@ -9,7 +9,7 @@ name       = "zrip"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-zstd   = { version = "0.8.4", package = "zrip", features = ["frame", "dict_builder"] }
+zstd   = { version = "0.8.5", package = "zrip", features = ["frame", "dict_builder"] }
 rb-sys = "0.9"
 
 [build-dependencies]
