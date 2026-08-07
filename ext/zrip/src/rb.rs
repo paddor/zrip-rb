@@ -69,9 +69,11 @@ pub fn raise(err: RubyErr) -> ! {
         RubyErr::Exception(exc) => unsafe { rb_sys::rb_exc_raise(exc) },
         RubyErr::Error { class, message } => {
             let message = message.replace('\0', "\\0");
-            let c_message =
-                CString::new(message).unwrap_or_else(|_| CString::new("Ruby error").unwrap());
-            let exc = unsafe { rb_sys::rb_exc_new_cstr(class, c_message.as_ptr()) };
+            let exc = {
+                let c_message =
+                    CString::new(message).unwrap_or_else(|_| CString::new("Ruby error").unwrap());
+                unsafe { rb_sys::rb_exc_new_cstr(class, c_message.as_ptr()) }
+            };
             unsafe { rb_sys::rb_exc_raise(exc) }
         }
     }
