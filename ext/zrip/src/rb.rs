@@ -1,4 +1,6 @@
 use std::ffi::{c_char, c_long, c_void, CStr, CString};
+#[cfg(ruby_engine = "mri")]
+use std::mem::MaybeUninit;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
@@ -11,6 +13,21 @@ unsafe extern "C" {
     fn rb_obj_frozen_p(obj: VALUE) -> VALUE;
     fn rb_str_locktmp(str: VALUE) -> VALUE;
     fn rb_str_unlocktmp(str: VALUE) -> VALUE;
+}
+
+#[cfg(ruby_engine = "mri")]
+type RbWithoutGvlFunc = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+#[cfg(ruby_engine = "mri")]
+type RbUnblockFunc = unsafe extern "C" fn(*mut c_void);
+
+#[cfg(ruby_engine = "mri")]
+unsafe extern "C" {
+    fn rb_thread_call_without_gvl(
+        func: Option<RbWithoutGvlFunc>,
+        data1: *mut c_void,
+        ubf: Option<RbUnblockFunc>,
+        data2: *mut c_void,
+    ) -> *mut c_void;
 }
 
 #[derive(Debug)]
@@ -145,6 +162,63 @@ where
         qnil()
     })?;
     Ok(())
+}
+
+#[cfg(ruby_engine = "mri")]
+struct WithoutGvlData<F, R> {
+    func: Option<F>,
+    output: MaybeUninit<R>,
+}
+
+#[cfg(ruby_engine = "mri")]
+unsafe extern "C" fn without_gvl_trampoline<F, R>(data: *mut c_void) -> *mut c_void
+where
+    F: FnOnce() -> R,
+{
+    let data = unsafe { &mut *(data.cast::<WithoutGvlData<F, R>>()) };
+    let func = data.func.take().expect("missing without-GVL function");
+    data.output.write(func());
+    ptr::null_mut()
+}
+
+#[cfg(ruby_engine = "mri")]
+fn without_gvl<F, R>(func: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let mut data = WithoutGvlData {
+        func: Some(func),
+        output: MaybeUninit::uninit(),
+    };
+    unsafe {
+        rb_thread_call_without_gvl(
+            Some(without_gvl_trampoline::<F, R>),
+            (&mut data as *mut WithoutGvlData<F, R>).cast::<c_void>(),
+            None,
+            ptr::null_mut(),
+        );
+        data.output.assume_init()
+    }
+}
+
+#[cfg(ruby_engine = "mri")]
+pub fn maybe_without_gvl<F, R>(release_gvl: bool, func: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if release_gvl {
+        without_gvl(func)
+    } else {
+        func()
+    }
+}
+
+#[cfg(not(ruby_engine = "mri"))]
+pub fn maybe_without_gvl<F, R>(_release_gvl: bool, func: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    func()
 }
 
 pub const fn qnil() -> VALUE {

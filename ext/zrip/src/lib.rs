@@ -2,11 +2,7 @@ mod rb;
 
 use std::ffi::c_void;
 use std::io::Read;
-#[cfg(ruby_engine = "mri")]
-use std::mem::MaybeUninit;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-#[cfg(ruby_engine = "mri")]
-use std::ptr;
 use std::sync::{Mutex, OnceLock, TryLockError};
 
 use rb_sys::{rb_data_type_struct__bindgen_ty_1, rb_data_type_t, size_t, VALUE};
@@ -47,21 +43,6 @@ fn output_size_limit_error() -> VALUE {
     stored_value(&OUTPUT_SIZE_LIMIT_ERROR, "OutputSizeLimitError")
 }
 
-#[cfg(ruby_engine = "mri")]
-type RbWithoutGvlFunc = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
-#[cfg(ruby_engine = "mri")]
-type RbUnblockFunc = unsafe extern "C" fn(*mut c_void);
-
-#[cfg(ruby_engine = "mri")]
-unsafe extern "C" {
-    fn rb_thread_call_without_gvl(
-        func: Option<RbWithoutGvlFunc>,
-        data1: *mut c_void,
-        ubf: Option<RbUnblockFunc>,
-        data2: *mut c_void,
-    ) -> *mut c_void;
-}
-
 fn should_release_compress_gvl(input_len: usize) -> bool {
     input_len >= GVL_COMPRESS_THRESHOLD
 }
@@ -70,69 +51,12 @@ fn should_release_frame_decompress_gvl(output_len: usize) -> bool {
     output_len >= GVL_FRAME_DECOMPRESS_THRESHOLD
 }
 
-#[cfg(ruby_engine = "mri")]
-struct WithoutGvlData<F, R> {
-    func: Option<F>,
-    output: MaybeUninit<R>,
-}
-
-#[cfg(ruby_engine = "mri")]
-unsafe extern "C" fn without_gvl_trampoline<F, R>(data: *mut c_void) -> *mut c_void
-where
-    F: FnOnce() -> R,
-{
-    let data = unsafe { &mut *(data.cast::<WithoutGvlData<F, R>>()) };
-    let func = data.func.take().expect("missing without-GVL function");
-    data.output.write(func());
-    ptr::null_mut()
-}
-
-#[cfg(ruby_engine = "mri")]
-fn without_gvl<F, R>(func: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let mut data = WithoutGvlData {
-        func: Some(func),
-        output: MaybeUninit::uninit(),
-    };
-    unsafe {
-        rb_thread_call_without_gvl(
-            Some(without_gvl_trampoline::<F, R>),
-            (&mut data as *mut WithoutGvlData<F, R>).cast::<c_void>(),
-            None,
-            ptr::null_mut(),
-        );
-        data.output.assume_init()
-    }
-}
-
-#[cfg(ruby_engine = "mri")]
-fn maybe_without_gvl<F, R>(release_gvl: bool, func: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    if release_gvl {
-        without_gvl(func)
-    } else {
-        func()
-    }
-}
-
-#[cfg(not(ruby_engine = "mri"))]
-fn maybe_without_gvl<F, R>(_release_gvl: bool, func: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    func()
-}
-
 fn with_mutex<T, R, F>(mutex: &Mutex<T>, release_gvl: bool, name: &str, func: F) -> RbResult<R>
 where
     F: FnOnce(&mut T) -> RbResult<R>,
 {
     if release_gvl {
-        return maybe_without_gvl(true, || {
+        return rb::maybe_without_gvl(true, || {
             let mut guard = mutex
                 .lock()
                 .map_err(|_| RubyErr::runtime(format!("{name} mutex poisoned")))?;
@@ -142,7 +66,7 @@ where
 
     match mutex.try_lock() {
         Ok(mut guard) => func(&mut guard),
-        Err(TryLockError::WouldBlock) => maybe_without_gvl(true, || {
+        Err(TryLockError::WouldBlock) => rb::maybe_without_gvl(true, || {
             let mut guard = mutex
                 .lock()
                 .map_err(|_| RubyErr::runtime(format!("{name} mutex poisoned")))?;
