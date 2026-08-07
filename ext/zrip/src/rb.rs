@@ -89,18 +89,18 @@ where
 }
 
 pub fn raise(err: RubyErr) -> ! {
-    match err {
-        RubyErr::Exception(exc) => unsafe { rb_sys::rb_exc_raise(exc) },
-        RubyErr::Error { class, message } => {
-            let message = message.replace('\0', "\\0");
-            let exc = {
-                let c_message =
-                    CString::new(message).unwrap_or_else(|_| CString::new("Ruby error").unwrap());
-                unsafe { rb_sys::rb_exc_new_cstr(class, c_message.as_ptr()) }
-            };
-            unsafe { rb_sys::rb_exc_raise(exc) }
-        }
-    }
+    let exc = match err {
+        RubyErr::Exception(exc) => exc,
+        RubyErr::Error { class, message } => error_exception(class, message),
+    };
+
+    unsafe { rb_sys::rb_exc_raise(exc) }
+}
+
+fn error_exception(class: VALUE, message: String) -> VALUE {
+    let message = message.replace('\0', "\\0");
+    let c_message = CString::new(message).unwrap_or_else(|_| CString::new("Ruby error").unwrap());
+    unsafe { rb_sys::rb_exc_new_cstr(class, c_message.as_ptr()) }
 }
 
 struct ProtectData<F> {
