@@ -1,6 +1,5 @@
 mod rb;
 
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::io::Read;
 #[cfg(ruby_engine = "mri")]
@@ -8,7 +7,7 @@ use std::mem::MaybeUninit;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(ruby_engine = "mri")]
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, TryLockError};
 
 use rb_sys::{rb_data_type_struct__bindgen_ty_1, rb_data_type_t, size_t, VALUE};
 use zstd::dict::fastcover::FastCoverParams;
@@ -126,6 +125,31 @@ where
     F: FnOnce() -> R,
 {
     func()
+}
+
+fn with_mutex<T, R, F>(mutex: &Mutex<T>, release_gvl: bool, name: &str, func: F) -> RbResult<R>
+where
+    F: FnOnce(&mut T) -> RbResult<R>,
+{
+    if release_gvl {
+        return maybe_without_gvl(true, || {
+            let mut guard = mutex
+                .lock()
+                .map_err(|_| RubyErr::runtime(format!("{name} mutex poisoned")))?;
+            func(&mut guard)
+        });
+    }
+
+    match mutex.try_lock() {
+        Ok(mut guard) => func(&mut guard),
+        Err(TryLockError::WouldBlock) => maybe_without_gvl(true, || {
+            let mut guard = mutex
+                .lock()
+                .map_err(|_| RubyErr::runtime(format!("{name} mutex poisoned")))?;
+            func(&mut guard)
+        }),
+        Err(TryLockError::Poisoned(_)) => Err(RubyErr::runtime(format!("{name} mutex poisoned"))),
+    }
 }
 
 // ---------- frame header parsing ----------
@@ -457,9 +481,11 @@ fn frame_codec_compress_impl(rb_self: VALUE, rb_input: VALUE) -> RbResult<VALUE>
     let mut input = rb::input_bytes(rb_input)?;
     let release_gvl = should_release_compress_gvl(input.len());
     input.lock_for_without_gvl(release_gvl)?;
-    let mut cctx = rb_self.cctx.lock().expect("FrameCodec CCtx mutex poisoned");
-    let out = maybe_without_gvl(release_gvl, || cctx.compress(input.as_slice()))
-        .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))?;
+    let out = with_mutex(&rb_self.cctx, release_gvl, "FrameCodec CCtx", |cctx| {
+        cctx.compress(input.as_slice())
+            .map(|out| out.into_owned())
+            .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))
+    })?;
     rb::new_binary_string(&out)
 }
 
@@ -477,11 +503,10 @@ fn frame_codec_decompress_impl(
     ));
     compressed.lock_for_without_gvl(release_gvl)?;
     let dict = rb_self.dict.clone();
-    let mut dctx = rb_self.dctx.lock().expect("FrameCodec DCtx mutex poisoned");
-    let out = maybe_without_gvl(release_gvl, || {
-        decompress_bounded(compressed.as_slice(), max_output, &mut dctx, dict.as_ref())
-    })
-    .map_err(|e| bounded_err(e, "zstd frame decode failed"))?;
+    let out = with_mutex(&rb_self.dctx, release_gvl, "FrameCodec DCtx", |dctx| {
+        decompress_bounded(compressed.as_slice(), max_output, dctx, dict.as_ref())
+            .map_err(|e| bounded_err(e, "zstd frame decode failed"))
+    })?;
     rb::new_binary_string(&out)
 }
 
@@ -565,8 +590,8 @@ struct BlockCodec {
     dict_id: Option<u32>,
     dict: Option<Dictionary>,
     level: i32,
-    cctx: RefCell<CompressContext>,
-    dctx: RefCell<DecompressContext>,
+    cctx: Mutex<CompressContext>,
+    dctx: Mutex<DecompressContext>,
 }
 
 fn block_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -> RbResult<VALUE> {
@@ -605,8 +630,8 @@ fn block_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
                 dict_id,
                 dict,
                 level,
-                cctx: RefCell::new(cctx),
-                dctx: RefCell::new(dctx),
+                cctx: Mutex::new(cctx),
+                dctx: Mutex::new(dctx),
             }),
             block_codec_data_type(),
         )
@@ -618,9 +643,11 @@ fn block_codec_compress_impl(rb_self: VALUE, rb_input: VALUE) -> RbResult<VALUE>
     let mut input = rb::input_bytes(rb_input)?;
     let release_gvl = should_release_compress_gvl(input.len());
     input.lock_for_without_gvl(release_gvl)?;
-    let mut cctx = rb_self.cctx.borrow_mut();
-    let out = maybe_without_gvl(release_gvl, || cctx.compress(input.as_slice()))
-        .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))?;
+    let out = with_mutex(&rb_self.cctx, release_gvl, "BlockCodec CCtx", |cctx| {
+        cctx.compress(input.as_slice())
+            .map(|out| out.into_owned())
+            .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))
+    })?;
     rb::new_binary_string(&out)
 }
 
@@ -632,14 +659,15 @@ fn block_codec_decompress_impl(
     let rb_self = unsafe { block_codec_ref(rb_self)? };
     let compressed = rb::input_bytes(rb_input)?;
     let max_output = rb::value_to_usize(max_output)?;
-    let mut dctx = rb_self.dctx.borrow_mut();
-    let out = decompress_bounded(
-        compressed.as_slice(),
-        max_output,
-        &mut dctx,
-        rb_self.dict.as_ref(),
-    )
-    .map_err(|e| bounded_err(e, "zstd block decode failed"))?;
+    let out = with_mutex(&rb_self.dctx, false, "BlockCodec DCtx", |dctx| {
+        decompress_bounded(
+            compressed.as_slice(),
+            max_output,
+            dctx,
+            rb_self.dict.as_ref(),
+        )
+        .map_err(|e| bounded_err(e, "zstd block decode failed"))
+    })?;
     rb::new_binary_string(&out)
 }
 
@@ -694,7 +722,7 @@ unsafe extern "C" fn block_codec_level(rb_self: VALUE) -> VALUE {
 // ---------- DictTrainer ----------
 
 struct RbDictTrainer {
-    inner: RefCell<Option<TrainerState>>,
+    inner: Mutex<Option<TrainerState>>,
     max_dict_size: usize,
 }
 
@@ -710,7 +738,7 @@ fn dict_trainer_new_impl(class: VALUE, max_dict_size: VALUE) -> RbResult<VALUE> 
             class,
             Box::new(RbDictTrainer {
                 max_dict_size,
-                inner: RefCell::new(Some(TrainerState {
+                inner: Mutex::new(Some(TrainerState {
                     samples: Vec::new(),
                     total_bytes: 0,
                 })),
@@ -722,7 +750,10 @@ fn dict_trainer_new_impl(class: VALUE, max_dict_size: VALUE) -> RbResult<VALUE> 
 
 fn dict_trainer_add_sample_impl(rb_self: VALUE, rb_data: VALUE) -> RbResult<VALUE> {
     let rb_self = unsafe { dict_trainer_ref(rb_self)? };
-    let mut borrow = rb_self.inner.borrow_mut();
+    let mut borrow = rb_self
+        .inner
+        .lock()
+        .map_err(|_| RubyErr::runtime("DictTrainer mutex poisoned"))?;
     let state = borrow
         .as_mut()
         .ok_or_else(|| RubyErr::runtime("DictTrainer already consumed by #train"))?;
@@ -737,7 +768,10 @@ fn dict_trainer_add_sample_impl(rb_self: VALUE, rb_data: VALUE) -> RbResult<VALU
 
 fn dict_trainer_sample_count_impl(rb_self: VALUE) -> RbResult<VALUE> {
     let rb_self = unsafe { dict_trainer_ref(rb_self)? };
-    let borrow = rb_self.inner.borrow();
+    let borrow = rb_self
+        .inner
+        .lock()
+        .map_err(|_| RubyErr::runtime("DictTrainer mutex poisoned"))?;
     let value = borrow
         .as_ref()
         .map(|s| s.samples.len())
@@ -747,7 +781,10 @@ fn dict_trainer_sample_count_impl(rb_self: VALUE) -> RbResult<VALUE> {
 
 fn dict_trainer_total_bytes_impl(rb_self: VALUE) -> RbResult<VALUE> {
     let rb_self = unsafe { dict_trainer_ref(rb_self)? };
-    let borrow = rb_self.inner.borrow();
+    let borrow = rb_self
+        .inner
+        .lock()
+        .map_err(|_| RubyErr::runtime("DictTrainer mutex poisoned"))?;
     let value = borrow
         .as_ref()
         .map(|s| s.total_bytes)
@@ -759,7 +796,8 @@ fn dict_trainer_train_impl(rb_self: VALUE) -> RbResult<VALUE> {
     let rb_self = unsafe { dict_trainer_ref(rb_self)? };
     let state = rb_self
         .inner
-        .borrow_mut()
+        .lock()
+        .map_err(|_| RubyErr::runtime("DictTrainer mutex poisoned"))?
         .take()
         .ok_or_else(|| RubyErr::runtime("DictTrainer already consumed by #train"))?;
 
@@ -787,7 +825,11 @@ fn dict_trainer_max_dict_size_impl(rb_self: VALUE) -> RbResult<VALUE> {
 
 fn dict_trainer_trained_impl(rb_self: VALUE) -> RbResult<VALUE> {
     let rb_self = unsafe { dict_trainer_ref(rb_self)? };
-    Ok(rb::bool_value(rb_self.inner.borrow().is_none()))
+    let borrow = rb_self
+        .inner
+        .lock()
+        .map_err(|_| RubyErr::runtime("DictTrainer mutex poisoned"))?;
+    Ok(rb::bool_value(borrow.is_none()))
 }
 
 unsafe extern "C" fn dict_trainer_new(class: VALUE, max_dict_size: VALUE) -> VALUE {
