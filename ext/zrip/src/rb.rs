@@ -6,6 +6,13 @@ use rb_sys::{rb_data_type_t, VALUE};
 
 pub type RbResult<T = VALUE> = Result<T, RubyErr>;
 
+#[cfg(ruby_engine = "mri")]
+unsafe extern "C" {
+    fn rb_obj_frozen_p(obj: VALUE) -> VALUE;
+    fn rb_str_locktmp(str: VALUE) -> VALUE;
+    fn rb_str_unlocktmp(str: VALUE) -> VALUE;
+}
+
 #[derive(Debug)]
 pub enum RubyErr {
     Exception(VALUE),
@@ -180,21 +187,7 @@ pub fn freeze_value(value: VALUE) -> RbResult<()> {
 
 pub fn value_to_bytes(value: VALUE) -> RbResult<Vec<u8>> {
     let string = string_value(value)?;
-    let len = unsafe { rb_sys::RSTRING_LEN(string) };
-    if len < 0 {
-        return Err(RubyErr::runtime("negative String length"));
-    }
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-
-    let ptr = unsafe { rb_sys::RSTRING_PTR(string) };
-    if ptr.is_null() {
-        return Err(RubyErr::runtime("null String pointer"));
-    }
-
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    Ok(bytes.to_vec())
+    bytes_from_string_value(string).map(|bytes| bytes.to_vec())
 }
 
 pub fn value_to_option_bytes(value: VALUE) -> RbResult<Option<Vec<u8>>> {
@@ -203,6 +196,122 @@ pub fn value_to_option_bytes(value: VALUE) -> RbResult<Option<Vec<u8>>> {
     } else {
         value_to_bytes(value).map(Some)
     }
+}
+
+pub enum InputBytes {
+    #[cfg(ruby_engine = "mri")]
+    Borrowed(BorrowedStringBytes),
+    #[cfg(not(ruby_engine = "mri"))]
+    Owned(Vec<u8>),
+}
+
+impl InputBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(ruby_engine = "mri")]
+            Self::Borrowed(bytes) => bytes.as_slice(),
+            #[cfg(not(ruby_engine = "mri"))]
+            Self::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn lock_for_without_gvl(&mut self, release_gvl: bool) -> RbResult<()> {
+        if !release_gvl {
+            return Ok(());
+        }
+
+        match self {
+            #[cfg(ruby_engine = "mri")]
+            Self::Borrowed(bytes) => bytes.lock_tmp(),
+            #[cfg(not(ruby_engine = "mri"))]
+            Self::Owned(_) => Ok(()),
+        }
+    }
+}
+
+#[cfg(ruby_engine = "mri")]
+pub struct BorrowedStringBytes {
+    value: VALUE,
+    ptr: *const u8,
+    len: usize,
+    locked: bool,
+}
+
+#[cfg(ruby_engine = "mri")]
+impl BorrowedStringBytes {
+    fn new(value: VALUE) -> RbResult<Self> {
+        let string = string_value(value)?;
+        let bytes = bytes_from_string_value(string)?;
+        Ok(Self {
+            value: string,
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+            locked: false,
+        })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    fn lock_tmp(&mut self) -> RbResult<()> {
+        if self.locked || unsafe { rb_obj_frozen_p(self.value) } == qtrue() {
+            return Ok(());
+        }
+
+        protect_value(|| unsafe { rb_str_locktmp(self.value) })?;
+        self.locked = true;
+        Ok(())
+    }
+}
+
+#[cfg(ruby_engine = "mri")]
+impl Drop for BorrowedStringBytes {
+    fn drop(&mut self) {
+        if self.locked {
+            unsafe {
+                rb_str_unlocktmp(self.value);
+            }
+        }
+        let _ = rb_sys::rb_gc_guard!(self.value);
+    }
+}
+
+pub fn input_bytes(value: VALUE) -> RbResult<InputBytes> {
+    #[cfg(ruby_engine = "mri")]
+    {
+        BorrowedStringBytes::new(value).map(InputBytes::Borrowed)
+    }
+
+    #[cfg(not(ruby_engine = "mri"))]
+    {
+        value_to_bytes(value).map(InputBytes::Owned)
+    }
+}
+
+fn bytes_from_string_value(string: VALUE) -> RbResult<&'static [u8]> {
+    let len = unsafe { rb_sys::RSTRING_LEN(string) };
+    if len < 0 {
+        return Err(RubyErr::runtime("negative String length"));
+    }
+    if len == 0 {
+        return Ok(&[]);
+    }
+
+    let ptr = unsafe { rb_sys::RSTRING_PTR(string) };
+    if ptr.is_null() {
+        return Err(RubyErr::runtime("null String pointer"));
+    }
+
+    Ok(unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) })
 }
 
 pub fn value_to_usize(value: VALUE) -> RbResult<usize> {
