@@ -406,6 +406,10 @@ pub unsafe fn define_error_under(outer: VALUE, name: &CStr, superclass: VALUE) -
     unsafe { define_class_under(outer, name, superclass) }
 }
 
+pub unsafe fn undef_alloc_func(class: VALUE) -> RbResult<()> {
+    protect_unit(|| unsafe { rb_sys::rb_undef_alloc_func(class) })
+}
+
 #[allow(dead_code)]
 pub unsafe fn define_module_function_0(
     module: VALUE,
