@@ -1,4 +1,4 @@
-# zrip — Ractor-safe Zstandard for Ruby
+# zrip: Ractor-safe Zstandard for Ruby
 
 [![CI](https://github.com/paddor/zrip-rb/actions/workflows/ci.yml/badge.svg)](https://github.com/paddor/zrip-rb/actions/workflows/ci.yml)
 [![Gem Version](https://img.shields.io/gem/v/zrip?color=e9573f)](https://rubygems.org/gems/zrip)
@@ -66,8 +66,8 @@ strong = Zrip::FrameCodec.new(level: 19)    # higher = smaller output
 ```ruby
 codec = Zrip::FrameCodec.new
 
-# Limit output size to 1 MiB
-codec.decompress(compressed, max_output_size: 1_048_576)
+# Limit total output size to 1 MiB
+codec.decompress(compressed, max_output_size: 1024 * 1024)
 
 # Read frame content size from header (without decompressing)
 Zrip::FrameCodec.get_frame_content_size(compressed)  #=> 12000
@@ -111,39 +111,9 @@ end
 ractors.each { |r| p r.value }  # => :ok, :ok, :ok, :ok
 ```
 
-## API
+## Documentation
 
-| Class / Module | Method | Description |
-|---|---|---|
-| `Zrip::FrameCodec` | `.new(dict: nil, level: 1)` | Create a frame codec, optionally with a `Dictionary`, raw `String` dict, or compression level |
-| | `.get_frame_content_size(string)` | Read Frame_Content_Size from a Zstd frame header |
-| | `#compress(string)` | Compress to Zstd frame |
-| | `#decompress(string, max_output_size: nil)` | Decompress a Zstd frame, optionally bounded |
-| | `#has_dict?` | Whether a dictionary is loaded |
-| | `#id` | Dictionary ID (nil without dict) |
-| | `#size` | Dictionary size in bytes (0 without dict) |
-| | `#level` | Compression level |
-| `Zrip::BlockCodec` | `.new(dict: nil, level: 1)` | Create a block codec, optionally with a dict |
-| | `#compress(string)` | Compress to Zstd block |
-| | `#decompress(string, max_output_size: nil)` | Decompress a Zstd block, optionally bounded |
-| | `#has_dict?` | Whether a dictionary is loaded |
-| | `#size` | Dictionary size in bytes (0 without dict) |
-| | `#level` | Compression level |
-| `Zrip::Dictionary` | `.new(bytes:, id: nil)` | Immutable dictionary value object (`Data.define`) |
-| | `#bytes` | Frozen binary dict bytes |
-| | `#id` | 32-bit dictionary ID (auto-detected from ZDICT header or SHA-256) |
-| | `#size` | Dictionary size in bytes |
-| `Zrip::DictTrainer` | `.new(max_dict_size)` | Create a trainer |
-| | `#add_sample(string)` | Feed a training sample (skips < 4 bytes) |
-| | `#train` | Consume the trainer, return dict bytes |
-| | `#sample_count` | Number of accepted samples |
-| | `#total_bytes` | Total bytes of accepted samples |
-| | `#trained?` | Whether `#train` has been called |
-| | `#max_dict_size` | Configured max dict size |
-| `Zrip::DecompressError` | | Raised on decompression failure |
-| `Zrip::CompressError` | | Raised on compression failure |
-| `Zrip::MissingContentSizeError` | | Raised when Frame_Content_Size is absent (subclass of `DecompressError`) |
-| `Zrip::OutputSizeLimitError` | | Raised when declared content size exceeds limit (subclass of `DecompressError`) |
+Reference: <https://rubydoc.info/gems/zrip>
 
 ## License
 

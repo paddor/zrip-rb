@@ -3,6 +3,13 @@
 require "digest"
 
 module Zrip
+  # Immutable Zstandard dictionary value.
+  #
+  # @!attribute [r] bytes
+  #   @return [String] frozen binary dictionary bytes
+  #
+  # @!attribute [r] id
+  #   @return [Integer] dictionary ID
   Dictionary = Data.define(:bytes, :id)
 
   class Dictionary
@@ -12,6 +19,8 @@ module Zrip
     USER_DICT_ID_SIZE = USER_DICT_ID_MAX - USER_DICT_ID_MIN + 1
 
 
+    # @param bytes [String] dictionary bytes
+    # @param id [Integer, nil] optional dictionary ID
     def initialize(bytes:, id: nil)
       b = bytes.b
       id ||= if b.byteslice(0, 4) == ZDICT_MAGIC
@@ -24,6 +33,7 @@ module Zrip
     end
 
 
+    # @return [Integer] dictionary size in bytes
     def size
       bytes.bytesize
     end

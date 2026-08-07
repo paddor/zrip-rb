@@ -46,7 +46,7 @@ class TestFrameCodecNoDict < Minitest::Test
 
 
   def test_round_trips_random_bytes_1mib
-    pt = Random.bytes(1_048_576)
+    pt = Random.bytes(1024 * 1024)
     assert_equal pt, @codec.decompress(@codec.compress(pt))
   end
 
@@ -55,6 +55,21 @@ class TestFrameCodecNoDict < Minitest::Test
     pt = (0..255).map(&:chr).join * 16
     pt.force_encoding(Encoding::ASCII_8BIT)
     assert_equal pt, @codec.decompress(@codec.compress(pt))
+  end
+
+
+  def test_decompresses_concatenated_frames_when_later_frame_is_larger
+    ct = @codec.compress("A") + @codec.compress("World!")
+    assert_equal "AWorld!", @codec.decompress(ct)
+  end
+
+
+  def test_max_output_size_applies_to_concatenated_output
+    ct = @codec.compress("a" * 100) + @codec.compress("b" * 100)
+    assert_raises(Zrip::OutputSizeLimitError) do
+      @codec.decompress(ct, max_output_size: 199)
+    end
+    assert_equal 200, @codec.decompress(ct, max_output_size: 200).bytesize
   end
 
 
@@ -147,7 +162,7 @@ end
 class TestDosResistance < Minitest::Test
   def test_no_large_output_string_on_failed_decompress
     codec   = Zrip::FrameCodec.new
-    size    = 1_048_576
+    size    = 1024 * 1024
     garbage = "\x00".b * size
 
     GC.start
@@ -256,7 +271,7 @@ class TestBlockCodecNoDict < Minitest::Test
 
 
   def test_round_trips_across_size_buckets
-    [0, 1, 64, 255, 256, 1024, 4096, 65_536, 1_048_576].each do |n|
+    [0, 1, 64, 255, 256, 1024, 4096, 65_536, 1024 * 1024].each do |n|
       pt = Random.bytes(n)
       ct = @codec.compress(pt)
       assert_equal pt, @codec.decompress(ct),
