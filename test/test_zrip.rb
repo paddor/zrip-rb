@@ -8,6 +8,10 @@ class Minitest::Test
   def require_ractor
     skip "Ractor is unavailable on this Ruby VM" unless defined?(Ractor)
   end
+
+  def ractor_value(ractor)
+    ractor.respond_to?(:value) ? ractor.value : ractor.take
+  end
 end
 
 
@@ -239,7 +243,7 @@ class TestDictionary < Minitest::Test
     require_ractor
 
     r = Ractor.new(Zrip::Dictionary.new(bytes: @bytes)) { |d| [d.bytes, d.id] }
-    got_bytes, got_id = r.value
+    got_bytes, got_id = ractor_value(r)
     assert_equal @bytes.b, got_bytes
     assert_kind_of Integer, got_id
   end
@@ -551,7 +555,7 @@ class TestRactorSafety < Minitest::Test
       ct    = codec.compress(pt)
       [ct.bytesize, codec.decompress(ct) == pt]
     end
-    size, ok = r.value
+    size, ok = ractor_value(r)
     assert_equal true, ok
     assert_operator size, :>, 0
   end
@@ -562,7 +566,7 @@ class TestRactorSafety < Minitest::Test
     r = Ractor.new(dict) do |d|
       [d.bytes, d.id]
     end
-    got_bytes, got_id = r.value
+    got_bytes, got_id = ractor_value(r)
     assert_equal ("shared dict prefix " * 4).b, got_bytes
     assert_kind_of Integer, got_id
   end
@@ -575,7 +579,7 @@ class TestRactorSafety < Minitest::Test
       ct  = c.compress(msg)
       c.decompress(ct) == msg
     end
-    assert_equal true, r.value
+    assert_equal true, ractor_value(r)
   end
 
 
@@ -599,7 +603,7 @@ class TestRactorSafety < Minitest::Test
         :ok
       end
     end
-    results = ractors.map(&:value)
+    results = ractors.map { |r| ractor_value(r) }
     assert_equal [:ok, :ok, :ok, :ok], results
   end
 end
