@@ -19,7 +19,7 @@ Gem::Specification.new do |s|
   s.required_ruby_version = ">= 3.4.0"
 
   s.metadata["homepage_uri"]      = s.homepage
-  s.metadata["source_code_uri"]   = s.homepage
+  s.metadata["source_code_uri"]   = "#{s.homepage}/tree/main"
   s.metadata["documentation_uri"] = "https://rubydoc.info/gems/zrip"
   s.metadata["changelog_uri"]     = "#{s.homepage}/blob/main/CHANGELOG.md"
   s.metadata["rubygems_mfa_required"] = "true"
@@ -38,5 +38,5 @@ Gem::Specification.new do |s|
   s.require_paths = ["lib"]
   s.extensions    = ["ext/zrip/extconf.rb"]
 
-  s.add_dependency "rb_sys", "~> 0.9"
+  s.add_dependency "rb_sys", "~> 0.9", ">= 0.9.130"
 end

@@ -1,7 +1,6 @@
 mod rb;
 
 use std::ffi::c_void;
-use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock, TryLockError};
 
@@ -18,7 +17,6 @@ static OUTPUT_SIZE_LIMIT_ERROR: OnceLock<GlobalValue> = OnceLock::new();
 
 const GVL_COMPRESS_THRESHOLD: usize = 64 * 1024;
 const GVL_FRAME_DECOMPRESS_THRESHOLD: usize = 64 * 1024;
-const DECOMPRESS_READ_CHUNK: usize = 16 * 1024;
 
 #[derive(Copy, Clone)]
 struct GlobalValue(VALUE);
@@ -52,27 +50,38 @@ fn should_release_frame_decompress_gvl(output_len: usize) -> bool {
     output_len >= GVL_FRAME_DECOMPRESS_THRESHOLD
 }
 
-fn with_mutex<T, R, F>(mutex: &Mutex<T>, release_gvl: bool, name: &str, func: F) -> RbResult<R>
+fn with_mutex<T, R, F>(
+    mutex: &Mutex<T>,
+    release_gvl: bool,
+    name: &str,
+    input: &mut rb::InputBytes,
+    func: F,
+) -> RbResult<R>
 where
-    F: FnOnce(&mut T) -> RbResult<R>,
+    F: FnOnce(&mut T, &[u8]) -> RbResult<R>,
 {
     if release_gvl {
+        input.lock_for_without_gvl(true)?;
         return rb::maybe_without_gvl(true, || {
             let mut guard = mutex
                 .lock()
                 .map_err(|_| RubyErr::runtime(format!("{name} mutex poisoned")))?;
-            func(&mut guard)
-        });
+            func(&mut guard, input.as_slice())
+        })?;
     }
 
     match mutex.try_lock() {
-        Ok(mut guard) => func(&mut guard),
-        Err(TryLockError::WouldBlock) => rb::maybe_without_gvl(true, || {
-            let mut guard = mutex
-                .lock()
-                .map_err(|_| RubyErr::runtime(format!("{name} mutex poisoned")))?;
-            func(&mut guard)
-        }),
+        Ok(mut guard) => func(&mut guard, input.as_slice()),
+        Err(TryLockError::WouldBlock) => {
+            // Even a small input needs protection when contention releases GVL.
+            input.lock_for_without_gvl(true)?;
+            rb::maybe_without_gvl(true, || {
+                let mut guard = mutex
+                    .lock()
+                    .map_err(|_| RubyErr::runtime(format!("{name} mutex poisoned")))?;
+                func(&mut guard, input.as_slice())
+            })?
+        }
         Err(TryLockError::Poisoned(_)) => Err(RubyErr::runtime(format!("{name} mutex poisoned"))),
     }
 }
@@ -89,119 +98,36 @@ enum BoundedError {
 }
 
 fn parse_frame_content_size(input: &[u8]) -> Result<Option<u64>, BoundedError> {
-    if input.len() < 5 {
-        return Err(BoundedError::BadMagic);
-    }
-    if input[..4] != ZSTD_FRAME_MAGIC {
-        return Err(BoundedError::BadMagic);
-    }
-    let fhd = input[4];
-    let fcs_flag = (fhd >> 6) & 3;
-    let single_segment = (fhd >> 5) & 1;
-    let dict_id_flag = fhd & 3;
-
-    let window_desc_size = if single_segment == 0 { 1usize } else { 0 };
-    let dict_id_size = [0usize, 1, 2, 4][dict_id_flag as usize];
-    let fcs_field_size = match fcs_flag {
-        0 => {
-            if single_segment == 1 {
-                1usize
-            } else {
-                return Ok(None);
-            }
-        }
-        1 => 2,
-        2 => 4,
-        3 => 8,
-        _ => unreachable!(),
-    };
-
-    let fcs_offset = 5 + window_desc_size + dict_id_size;
-    if input.len() < fcs_offset + fcs_field_size {
-        return Err(BoundedError::BadMagic);
-    }
-
-    let fcs_bytes = &input[fcs_offset..fcs_offset + fcs_field_size];
-    let value = match fcs_field_size {
-        1 => fcs_bytes[0] as u64,
-        2 => u16::from_le_bytes([fcs_bytes[0], fcs_bytes[1]]) as u64 + 256,
-        4 => u32::from_le_bytes([fcs_bytes[0], fcs_bytes[1], fcs_bytes[2], fcs_bytes[3]]) as u64,
-        8 => u64::from_le_bytes(fcs_bytes.try_into().unwrap()),
-        _ => unreachable!(),
-    };
-
-    Ok(Some(value))
-}
-
-fn io_error_is_output_too_small(err: &std::io::Error) -> bool {
-    matches!(
-        err.get_ref()
-            .and_then(|inner| inner.downcast_ref::<zstd::error::DecompressError>()),
-        Some(zstd::error::DecompressError::OutputTooSmall)
-    )
-}
-
-fn read_decoder_bounded<R: Read>(
-    decoder: &mut R,
-    max_output: usize,
-) -> Result<Vec<u8>, BoundedError> {
-    let mut output = Vec::new();
-    let mut buf = [0u8; DECOMPRESS_READ_CHUNK];
-
-    loop {
-        let n = decoder.read(&mut buf).map_err(|e| {
-            if io_error_is_output_too_small(&e) {
-                BoundedError::OutputSizeLimit {
-                    limit: max_output as u64,
-                }
-            } else {
-                BoundedError::DecoderFailed(format!("{e}"))
-            }
-        })?;
-        if n == 0 {
-            return Ok(output);
-        }
-
-        let Some(next_len) = output.len().checked_add(n) else {
-            return Err(BoundedError::OutputSizeLimit {
-                limit: max_output as u64,
-            });
-        };
-        if next_len > max_output {
-            return Err(BoundedError::OutputSizeLimit {
-                limit: max_output as u64,
-            });
-        }
-
-        output.extend_from_slice(&buf[..n]);
-    }
+    zstd::frame::header::parse_frame_header(input)
+        .map(|header| header.frame_content_size)
+        .map_err(|err| match err {
+            zstd::DecompressError::BadMagic => BoundedError::BadMagic,
+            _ => BoundedError::DecoderFailed(err.to_string()),
+        })
 }
 
 fn decompress_bounded(
     compressed: &[u8],
     max_output: usize,
     dctx: &mut DecompressContext,
-    dict: Option<&Dictionary>,
 ) -> Result<Vec<u8>, BoundedError> {
     if compressed.len() < ZSTD_FRAME_MAGIC.len() || compressed[..4] != ZSTD_FRAME_MAGIC {
         return Err(BoundedError::BadMagic);
     }
 
-    let result = if max_output == 0 {
-        dctx.decompress_with_limit(compressed, usize::MAX)
-            .map(|out| out.into_owned())
-            .map_err(|e| BoundedError::DecoderFailed(format!("{e}")))?
+    let limit = if max_output == 0 {
+        usize::MAX
     } else {
-        let mut decoder = match dict {
-            Some(dict) => {
-                zstd::FrameDecoder::with_dict_and_limit(compressed, dict.clone(), usize::MAX)
-            }
-            None => zstd::FrameDecoder::with_limit(compressed, usize::MAX),
-        };
-        read_decoder_bounded(&mut decoder, max_output)?
+        max_output
     };
-
-    Ok(result)
+    dctx.decompress_with_limit(compressed, limit)
+        .map(|out| out.into_owned())
+        .map_err(|err| match err {
+            zstd::DecompressError::OutputTooSmall => BoundedError::OutputSizeLimit {
+                limit: max_output as u64,
+            },
+            _ => BoundedError::DecoderFailed(err.to_string()),
+        })
 }
 
 fn decompress_work_size(compressed: &[u8], max_output: usize) -> usize {
@@ -277,7 +203,7 @@ fn make_frame_codec_data_type() -> rb_data_type_t {
         },
         parent: std::ptr::null(),
         data: std::ptr::null_mut(),
-        flags: 1,
+        flags: rb::frozen_shareable_flags(),
     }
 }
 
@@ -372,7 +298,6 @@ unsafe fn dict_trainer_ref(value: VALUE) -> RbResult<&'static RbDictTrainer> {
 struct FrameCodec {
     dict_len: usize,
     dict_id: Option<u32>,
-    dict: Option<Dictionary>,
     level: i32,
     cctx: Mutex<CompressContext>,
     dctx: Mutex<DecompressContext>,
@@ -382,16 +307,10 @@ unsafe impl Send for FrameCodec {}
 unsafe impl Sync for FrameCodec {}
 
 fn frame_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -> RbResult<VALUE> {
-    let rb_dict = if rb_dict == rb::qnil() {
-        None
-    } else {
-        let rb_dict = rb::string_value(rb_dict)?;
-        rb::freeze_value(rb_dict)?;
-        Some(rb::value_to_bytes(rb_dict)?)
-    };
+    let rb_dict = rb::value_to_option_bytes(rb_dict)?;
     let id = rb::value_to_u32(id)?;
     let level = rb::value_to_i32(level)?;
-    let (dict_len, dict_id, dict, cctx, dctx) = match rb_dict {
+    let (dict_len, dict_id, cctx, dctx) = match rb_dict {
         None => {
             let cctx = CompressContext::new(level).map_err(|e| {
                 RubyErr::new(
@@ -399,7 +318,7 @@ fn frame_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
                     format!("CompressContext::new failed: {e}"),
                 )
             })?;
-            (0, None, None, cctx, DecompressContext::new())
+            (0, None, cctx, DecompressContext::new())
         }
         Some(bytes) => {
             let dict = load_dict(&bytes)?;
@@ -411,36 +330,42 @@ fn frame_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
                 )
             })?;
             let dctx = DecompressContext::with_dict(dict.clone());
-            (dl, Some(id), Some(dict), cctx, dctx)
+            (dl, Some(id), cctx, dctx)
         }
     };
 
-    unsafe {
+    let codec = unsafe {
         rb::wrap_typed_data(
             class,
             Box::new(FrameCodec {
                 dict_len,
                 dict_id,
-                dict,
                 level,
                 cctx: Mutex::new(cctx),
                 dctx: Mutex::new(dctx),
             }),
             frame_codec_data_type(),
-        )
-    }
+        )?
+    };
+    rb::make_shareable(codec)?;
+    Ok(codec)
 }
 
 fn frame_codec_compress_impl(rb_self: VALUE, rb_input: VALUE) -> RbResult<VALUE> {
     let rb_self = unsafe { frame_codec_ref(rb_self)? };
     let mut input = rb::input_bytes(rb_input)?;
     let release_gvl = should_release_compress_gvl(input.len());
-    input.lock_for_without_gvl(release_gvl)?;
-    let out = with_mutex(&rb_self.cctx, release_gvl, "FrameCodec CCtx", |cctx| {
-        cctx.compress(input.as_slice())
-            .map(|out| out.into_owned())
-            .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))
-    })?;
+    let out = with_mutex(
+        &rb_self.cctx,
+        release_gvl,
+        "FrameCodec CCtx",
+        &mut input,
+        |cctx, input| {
+            cctx.compress(input)
+                .map(|out| out.into_owned())
+                .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))
+        },
+    )?;
     rb::new_binary_string(&out)
 }
 
@@ -450,18 +375,22 @@ fn frame_codec_decompress_impl(
     max_output: VALUE,
 ) -> RbResult<VALUE> {
     let rb_self = unsafe { frame_codec_ref(rb_self)? };
-    let mut compressed = rb::input_bytes(rb_input)?;
     let max_output = rb::value_to_usize(max_output)?;
+    let mut compressed = rb::input_bytes(rb_input)?;
     let release_gvl = should_release_frame_decompress_gvl(decompress_work_size(
         compressed.as_slice(),
         max_output,
     ));
-    compressed.lock_for_without_gvl(release_gvl)?;
-    let dict = rb_self.dict.clone();
-    let out = with_mutex(&rb_self.dctx, release_gvl, "FrameCodec DCtx", |dctx| {
-        decompress_bounded(compressed.as_slice(), max_output, dctx, dict.as_ref())
-            .map_err(|e| bounded_err(e, "zstd frame decode failed"))
-    })?;
+    let out = with_mutex(
+        &rb_self.dctx,
+        release_gvl,
+        "FrameCodec DCtx",
+        &mut compressed,
+        |dctx, compressed| {
+            decompress_bounded(compressed, max_output, dctx)
+                .map_err(|e| bounded_err(e, "zstd frame decode failed"))
+        },
+    )?;
     rb::new_binary_string(&out)
 }
 
@@ -543,7 +472,6 @@ unsafe extern "C" fn frame_codec_get_frame_content_size(_class: VALUE, rb_input:
 struct BlockCodec {
     dict_len: usize,
     dict_id: Option<u32>,
-    dict: Option<Dictionary>,
     level: i32,
     cctx: Mutex<CompressContext>,
     dctx: Mutex<DecompressContext>,
@@ -553,7 +481,7 @@ fn block_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
     let rb_dict = rb::value_to_option_bytes(rb_dict)?;
     let id = rb::value_to_u32(id)?;
     let level = rb::value_to_i32(level)?;
-    let (dict_len, dict_id, dict, cctx, dctx) = match rb_dict {
+    let (dict_len, dict_id, cctx, dctx) = match rb_dict {
         None => {
             let cctx = CompressContext::new(level).map_err(|e| {
                 RubyErr::new(
@@ -561,7 +489,7 @@ fn block_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
                     format!("CompressContext::new failed: {e}"),
                 )
             })?;
-            (0, None, None, cctx, DecompressContext::new())
+            (0, None, cctx, DecompressContext::new())
         }
         Some(bytes) => {
             let dict = load_dict(&bytes)?;
@@ -573,7 +501,7 @@ fn block_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
                 )
             })?;
             let dctx = DecompressContext::with_dict(dict.clone());
-            (dl, Some(id), Some(dict), cctx, dctx)
+            (dl, Some(id), cctx, dctx)
         }
     };
 
@@ -583,7 +511,6 @@ fn block_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
             Box::new(BlockCodec {
                 dict_len,
                 dict_id,
-                dict,
                 level,
                 cctx: Mutex::new(cctx),
                 dctx: Mutex::new(dctx),
@@ -597,12 +524,17 @@ fn block_codec_compress_impl(rb_self: VALUE, rb_input: VALUE) -> RbResult<VALUE>
     let rb_self = unsafe { block_codec_ref(rb_self)? };
     let mut input = rb::input_bytes(rb_input)?;
     let release_gvl = should_release_compress_gvl(input.len());
-    input.lock_for_without_gvl(release_gvl)?;
-    let out = with_mutex(&rb_self.cctx, release_gvl, "BlockCodec CCtx", |cctx| {
-        cctx.compress(input.as_slice())
-            .map(|out| out.into_owned())
-            .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))
-    })?;
+    let out = with_mutex(
+        &rb_self.cctx,
+        release_gvl,
+        "BlockCodec CCtx",
+        &mut input,
+        |cctx, input| {
+            cctx.compress(input)
+                .map(|out| out.into_owned())
+                .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))
+        },
+    )?;
     rb::new_binary_string(&out)
 }
 
@@ -612,17 +544,18 @@ fn block_codec_decompress_impl(
     max_output: VALUE,
 ) -> RbResult<VALUE> {
     let rb_self = unsafe { block_codec_ref(rb_self)? };
-    let compressed = rb::input_bytes(rb_input)?;
     let max_output = rb::value_to_usize(max_output)?;
-    let out = with_mutex(&rb_self.dctx, false, "BlockCodec DCtx", |dctx| {
-        decompress_bounded(
-            compressed.as_slice(),
-            max_output,
-            dctx,
-            rb_self.dict.as_ref(),
-        )
-        .map_err(|e| bounded_err(e, "zstd block decode failed"))
-    })?;
+    let mut compressed = rb::input_bytes(rb_input)?;
+    let out = with_mutex(
+        &rb_self.dctx,
+        false,
+        "BlockCodec DCtx",
+        &mut compressed,
+        |dctx, compressed| {
+            decompress_bounded(compressed, max_output, dctx)
+                .map_err(|e| bounded_err(e, "zstd block decode failed"))
+        },
+    )?;
     rb::new_binary_string(&out)
 }
 
@@ -704,6 +637,7 @@ fn dict_trainer_new_impl(class: VALUE, max_dict_size: VALUE) -> RbResult<VALUE> 
 }
 
 fn dict_trainer_add_sample_impl(rb_self: VALUE, rb_data: VALUE) -> RbResult<VALUE> {
+    let data = rb::value_to_bytes(rb_data)?;
     let rb_self = unsafe { dict_trainer_ref(rb_self)? };
     let mut borrow = rb_self
         .inner
@@ -712,7 +646,6 @@ fn dict_trainer_add_sample_impl(rb_self: VALUE, rb_data: VALUE) -> RbResult<VALU
     let state = borrow
         .as_mut()
         .ok_or_else(|| RubyErr::runtime("DictTrainer already consumed by #train"))?;
-    let data = rb::value_to_bytes(rb_data)?;
     if data.len() < 4 {
         return Ok(rb::qnil());
     }
@@ -960,11 +893,11 @@ mod tests {
         compressed.extend_from_slice(&zstd::compress(&[b'b'; 100], 1).unwrap());
 
         assert!(matches!(
-            decompress_bounded(&compressed, 199, &mut dctx, None),
+            decompress_bounded(&compressed, 199, &mut dctx),
             Err(BoundedError::OutputSizeLimit { .. })
         ));
         assert_eq!(
-            decompress_bounded(&compressed, 200, &mut dctx, None)
+            decompress_bounded(&compressed, 200, &mut dctx)
                 .unwrap()
                 .len(),
             200

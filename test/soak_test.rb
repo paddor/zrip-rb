@@ -2,13 +2,13 @@
 
 require_relative "test_helper"
 
-class TestNativeSoak < Minitest::Test
+class TestNativeSoak < Minitest::Spec
   ONE_KIB = 1024
-  ONE_MIB = 1024 * 1024
-  RSS_LIMIT_KB = Integer(ENV.fetch("SOAK_RSS_LIMIT_MB", "256")) * 1024
+  ONE_MIB = ONE_KIB * ONE_KIB
+  RSS_LIMIT_KB = Integer(ENV.fetch("SOAK_RSS_LIMIT_MB", "256")) * ONE_KIB
   THREADS = Integer(ENV.fetch("SOAK_THREADS", "4"))
 
-  def test_codecs_survive_long_running_native_use
+  it "survives long running native use" do
     deadline = now + Float(ENV.fetch("SOAK_SECONDS", "60"))
     payloads = [payload(ONE_KIB), payload(ONE_MIB)]
     frame = Zrip::FrameCodec.new(level: 1)

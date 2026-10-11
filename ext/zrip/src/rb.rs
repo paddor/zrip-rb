@@ -1,6 +1,4 @@
 use std::ffi::{c_char, c_long, c_void, CStr, CString};
-#[cfg(ruby_engine = "mri")]
-use std::mem::MaybeUninit;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
@@ -32,7 +30,7 @@ unsafe extern "C" {
 
 #[derive(Debug)]
 pub enum RubyErr {
-    Exception(VALUE),
+    Jump(i32),
     Error { class: VALUE, message: String },
 }
 
@@ -54,15 +52,6 @@ impl RubyErr {
 
     pub fn type_error(message: impl Into<String>) -> Self {
         Self::new(unsafe { rb_sys::rb_eTypeError }, message)
-    }
-
-    fn current_exception() -> Self {
-        let err = unsafe { rb_sys::rb_errinfo() };
-        if err == qnil() {
-            Self::runtime("Ruby exception")
-        } else {
-            Self::Exception(err)
-        }
     }
 }
 
@@ -89,12 +78,15 @@ where
 }
 
 pub fn raise(err: RubyErr) -> ! {
-    let exc = match err {
-        RubyErr::Exception(exc) => exc,
-        RubyErr::Error { class, message } => error_exception(class, message),
-    };
-
-    unsafe { rb_sys::rb_exc_raise(exc) }
+    match err {
+        // Preserve Ruby's tag and pending error info for Thread#kill and
+        // catch/throw, as well as ordinary exceptions.
+        RubyErr::Jump(state) => unsafe { rb_sys::rb_jump_tag(state) },
+        RubyErr::Error { class, message } => {
+            let exc = error_exception(class, message);
+            unsafe { rb_sys::rb_exc_raise(exc) }
+        }
+    }
 }
 
 fn error_exception(class: VALUE, message: String) -> VALUE {
@@ -145,7 +137,7 @@ where
     };
 
     if state != 0 {
-        Err(RubyErr::current_exception())
+        Err(RubyErr::Jump(state))
     } else if data.panicked {
         Err(RubyErr::runtime("native Rust panic"))
     } else {
@@ -167,7 +159,7 @@ where
 #[cfg(ruby_engine = "mri")]
 struct WithoutGvlData<F, R> {
     func: Option<F>,
-    output: MaybeUninit<R>,
+    output: Option<std::thread::Result<R>>,
 }
 
 #[cfg(ruby_engine = "mri")]
@@ -176,49 +168,55 @@ where
     F: FnOnce() -> R,
 {
     let data = unsafe { &mut *(data.cast::<WithoutGvlData<F, R>>()) };
-    let func = data.func.take().expect("missing without-GVL function");
-    data.output.write(func());
+    // Rust panics must be caught before returning through the C callback.
+    data.output = Some(catch_unwind(AssertUnwindSafe(|| {
+        data.func.take().expect("missing without-GVL function")()
+    })));
     ptr::null_mut()
 }
 
 #[cfg(ruby_engine = "mri")]
-fn without_gvl<F, R>(func: F) -> R
+fn without_gvl<F, R>(func: F) -> RbResult<R>
 where
     F: FnOnce() -> R,
 {
     let mut data = WithoutGvlData {
         func: Some(func),
-        output: MaybeUninit::uninit(),
+        output: None,
     };
-    unsafe {
+    // Ruby checks interrupts before and after the callback. Protect the call
+    // so an exception still drops native output and unlocks borrowed strings.
+    protect_unit(|| unsafe {
         rb_thread_call_without_gvl(
             Some(without_gvl_trampoline::<F, R>),
             (&mut data as *mut WithoutGvlData<F, R>).cast::<c_void>(),
             None,
             ptr::null_mut(),
         );
-        data.output.assume_init()
-    }
+    })?;
+    data.output
+        .ok_or_else(|| RubyErr::runtime("without-GVL callback did not run"))?
+        .map_err(|_| RubyErr::runtime("native Rust panic"))
 }
 
 #[cfg(ruby_engine = "mri")]
-pub fn maybe_without_gvl<F, R>(release_gvl: bool, func: F) -> R
+pub fn maybe_without_gvl<F, R>(release_gvl: bool, func: F) -> RbResult<R>
 where
     F: FnOnce() -> R,
 {
     if release_gvl {
         without_gvl(func)
     } else {
-        func()
+        Ok(func())
     }
 }
 
 #[cfg(not(ruby_engine = "mri"))]
-pub fn maybe_without_gvl<F, R>(_release_gvl: bool, func: F) -> R
+pub fn maybe_without_gvl<F, R>(_release_gvl: bool, func: F) -> RbResult<R>
 where
     F: FnOnce() -> R,
 {
-    func()
+    Ok(func())
 }
 
 pub const fn qnil() -> VALUE {
@@ -255,8 +253,23 @@ pub fn string_value(value: VALUE) -> RbResult<VALUE> {
     protect_value(|| unsafe { rb_sys::rb_str_to_str(value) })
 }
 
-pub fn freeze_value(value: VALUE) -> RbResult<()> {
-    protect_unit(|| unsafe { rb_sys::RB_OBJ_FREEZE(value) })
+pub fn frozen_shareable_flags() -> VALUE {
+    #[cfg(ruby_engine = "mri")]
+    {
+        // RUBY_TYPED_FROZEN_SHAREABLE equals RUBY_FL_SHAREABLE in Ruby headers.
+        1 | rb_sys::ruby_fl_type::RUBY_FL_SHAREABLE as VALUE
+    }
+    #[cfg(not(ruby_engine = "mri"))]
+    {
+        1
+    }
+}
+
+pub fn make_shareable(value: VALUE) -> RbResult<()> {
+    protect_unit(|| unsafe { rb_sys::RB_OBJ_FREEZE(value) })?;
+    #[cfg(ruby_engine = "mri")]
+    protect_value(|| unsafe { rb_sys::rb_ractor_make_shareable(value) })?;
+    Ok(())
 }
 
 pub fn value_to_bytes(value: VALUE) -> RbResult<Vec<u8>> {
@@ -612,4 +625,43 @@ unsafe fn transmute_3(
 
 fn c_long_len(len: usize) -> RbResult<c_long> {
     c_long::try_from(len).map_err(|_| RubyErr::arg("length too large"))
+}
+
+#[cfg(all(test, ruby_engine = "mri"))]
+mod tests {
+    use super::*;
+
+    fn run_callback<F, R>(func: F) -> std::thread::Result<R>
+    where
+        F: FnOnce() -> R,
+    {
+        let mut data = WithoutGvlData {
+            func: Some(func),
+            output: None,
+        };
+        unsafe {
+            without_gvl_trampoline::<F, R>(
+                (&mut data as *mut WithoutGvlData<F, R>).cast::<c_void>(),
+            );
+        }
+        data.output.unwrap()
+    }
+
+    #[test]
+    fn callback_catches_panics_before_returning_to_c() {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct OnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let captured = OnDrop(dropped.clone());
+        let result = run_callback(move || {
+            let _captured = captured;
+            panic!("callback panic");
+        });
+        assert!(result.is_err());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }

@@ -58,7 +58,7 @@ original   = codec.decompress(compressed)
 
 ```ruby
 fast   = Zrip::FrameCodec.new(level: -3)   # negative = faster
-strong = Zrip::FrameCodec.new(level: 19)    # higher = smaller output
+strong = Zrip::FrameCodec.new(level: 4)    # highest supported level
 ```
 
 ### Bounded decompression
