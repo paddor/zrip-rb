@@ -11,10 +11,14 @@ jobs:
       matrix:
         ruby: ['3.4', '4.0', 'truffleruby']
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: ruby/setup-ruby@v1
       with:
         ruby-version: ${{ matrix.ruby }}
         bundler-cache: true
     - run: timeout 180 bundle exec rake
+    - if: matrix.ruby == '4.0'
+      run: cargo fmt --check
+    - if: matrix.ruby == '4.0'
+      run: bundle exec rake cargo_test clippy

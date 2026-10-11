@@ -4,50 +4,39 @@ require_relative "test_helper"
 require "objspace"
 require "digest"
 
-class Minitest::Test
-  def require_ractor
-    skip "Ractor is unavailable on this Ruby VM" unless defined?(Ractor)
-  end
-
-  def ractor_value(ractor)
-    ractor.respond_to?(:value) ? ractor.value : ractor.take
-  end
-end
-
-
-class TestVersion < Minitest::Test
-  def test_version_is_a_non_empty_string
+describe Zrip do
+  it "version is a non empty string" do
     assert_instance_of String, Zrip::VERSION
     refute_empty Zrip::VERSION
   end
 end
 
 
-class TestFrameCodecNoDict < Minitest::Test
-  def setup
+describe Zrip::FrameCodec, "without a dictionary" do
+  before do
     @codec = Zrip::FrameCodec.new
   end
 
 
-  def test_round_trips_empty_string
+  it "round trips empty string" do
     ct = @codec.compress("")
     assert_equal "", @codec.decompress(ct)
   end
 
 
-  def test_round_trips_single_byte
+  it "round trips single byte" do
     ct = @codec.compress("x")
     assert_equal "x", @codec.decompress(ct)
   end
 
 
-  def test_round_trips_ascii_text
+  it "round trips ascii text" do
     pt = "the quick brown fox jumps over the lazy dog"
     assert_equal pt, @codec.decompress(@codec.compress(pt))
   end
 
 
-  def test_round_trips_repetitive_input_and_compresses
+  it "round trips repetitive input and compresses" do
     pt = "A" * 100_000
     ct = @codec.compress(pt)
     assert_operator ct.bytesize, :<, pt.bytesize / 10
@@ -55,26 +44,26 @@ class TestFrameCodecNoDict < Minitest::Test
   end
 
 
-  def test_round_trips_random_bytes_1mib
+  it "round trips random bytes 1mib" do
     pt = Random.bytes(1024 * 1024)
     assert_equal pt, @codec.decompress(@codec.compress(pt))
   end
 
 
-  def test_round_trips_binary_data_with_nul_bytes
+  it "round trips binary data with nul bytes" do
     pt = (0..255).map(&:chr).join * 16
     pt.force_encoding(Encoding::ASCII_8BIT)
     assert_equal pt, @codec.decompress(@codec.compress(pt))
   end
 
 
-  def test_decompresses_concatenated_frames_when_later_frame_is_larger
+  it "decompresses concatenated frames when later frame is larger" do
     ct = @codec.compress("A") + @codec.compress("World!")
     assert_equal "AWorld!", @codec.decompress(ct)
   end
 
 
-  def test_max_output_size_applies_to_concatenated_output
+  it "max output size applies to concatenated output" do
     ct = @codec.compress("a" * 100) + @codec.compress("b" * 100)
     assert_raises(Zrip::OutputSizeLimitError) do
       @codec.decompress(ct, max_output_size: 199)
@@ -83,13 +72,13 @@ class TestFrameCodecNoDict < Minitest::Test
   end
 
 
-  def test_emits_zstd_frame_magic
+  it "emits zstd frame magic" do
     ct = @codec.compress("anything")
     assert_equal [0x28, 0xB5, 0x2F, 0xFD], ct.bytes.first(4)
   end
 
 
-  def test_accepts_explicit_compression_level
+  it "accepts explicit compression level" do
     c1 = Zrip::FrameCodec.new(level: -3)
     c3 = Zrip::FrameCodec.new(level: 4)
     pt = ("X" * 100_000).b
@@ -101,39 +90,39 @@ class TestFrameCodecNoDict < Minitest::Test
   end
 
 
-  def test_compress_returns_binary_encoding
+  it "compress returns binary encoding" do
     ct = @codec.compress("hello")
     assert_equal Encoding::ASCII_8BIT, ct.encoding
   end
 
 
-  def test_decompress_returns_binary_encoding
+  it "decompress returns binary encoding" do
     pt = @codec.decompress(@codec.compress("hello"))
     assert_equal Encoding::ASCII_8BIT, pt.encoding
   end
 
 
-  def test_raises_decompress_error_on_garbage
+  it "raises decompress error on garbage" do
     assert_raises(Zrip::DecompressError) { @codec.decompress("not a valid zstd frame") }
   end
 
 
-  def test_raises_decompress_error_on_empty_input
+  it "raises decompress error on empty input" do
     assert_raises(Zrip::DecompressError) { @codec.decompress("") }
   end
 
 
-  def test_decompress_error_is_standard_error_subclass
+  it "decompress error is standard error subclass" do
     assert_includes Zrip::DecompressError.ancestors, StandardError
   end
 
 
-  def test_compress_error_is_standard_error_subclass
+  it "compress error is standard error subclass" do
     assert_includes Zrip::CompressError.ancestors, StandardError
   end
 
 
-  def test_has_dict_false_and_id_nil
+  it "has dict false and id nil" do
     refute_predicate @codec, :has_dict?
     assert_nil @codec.id
     assert_equal 0, @codec.size
@@ -141,36 +130,84 @@ class TestFrameCodecNoDict < Minitest::Test
 end
 
 
-class TestGetFrameContentSize < Minitest::Test
-  def setup
+describe "Zrip::FrameCodec.get_frame_content_size" do
+  before do
     @codec = Zrip::FrameCodec.new
   end
 
 
-  def test_returns_declared_content_size
+  it "returns declared content size" do
     pt = "X" * 12_345
     ct = @codec.compress(pt)
     assert_equal pt.bytesize, Zrip::FrameCodec.get_frame_content_size(ct)
   end
 
 
-  def test_raises_decompress_error_on_garbage
+  it "raises decompress error on garbage" do
     assert_raises(Zrip::DecompressError) do
       Zrip::FrameCodec.get_frame_content_size("not a valid zstd frame")
     end
   end
 
 
-  def test_raises_decompress_error_on_empty_input
+  it "raises decompress error on empty input" do
     assert_raises(Zrip::DecompressError) do
       Zrip::FrameCodec.get_frame_content_size("")
     end
   end
+
+
+  it "rejects truncated header without content size" do
+    header = "\x28\xB5\x2F\xFD\x00".b
+    assert_raises(Zrip::DecompressError) { Zrip::FrameCodec.get_frame_content_size(header) }
+    assert_nil Zrip::FrameCodec.get_frame_content_size(header + "\x00".b)
+  end
+
+
+  it "rejects reserved descriptor bit" do
+    compressed = @codec.compress("payload")
+    compressed.setbyte(4, compressed.getbyte(4) | 0x08)
+    assert_raises(Zrip::DecompressError) { Zrip::FrameCodec.get_frame_content_size(compressed) }
+  end
+
+
+  it "ignores unused descriptor bit" do
+    compressed = @codec.compress("payload")
+    compressed.setbyte(4, compressed.getbyte(4) | 0x10)
+    assert_equal 7, Zrip::FrameCodec.get_frame_content_size(compressed)
+  end
 end
 
 
-class TestDosResistance < Minitest::Test
-  def test_no_large_output_string_on_failed_decompress
+describe "Zrip decompression limits" do
+  it "rejects large declared size before decoding" do
+    header = "\x28\xB5\x2F\xFD\xE0".b + [2**32].pack("Q<")
+    [Zrip::FrameCodec.new, Zrip::BlockCodec.new].each do |codec|
+      assert_raises(Zrip::OutputSizeLimitError) do
+        codec.decompress(header, max_output_size: 1024)
+      end
+      assert_equal "usable", codec.decompress(codec.compress("usable"))
+    end
+  end
+
+
+  it "bounds frames without content size" do
+    payload = "payload".b * 100
+    header = "\x28\xB5\x2F\xFD\x00\x00".b
+    block_header = [(payload.bytesize << 3) | 1].pack("V").byteslice(0, 3)
+    compressed = header + block_header + payload
+
+    [Zrip::FrameCodec.new, Zrip::BlockCodec.new].each do |codec|
+      assert_nil Zrip::FrameCodec.get_frame_content_size(compressed)
+      assert_raises(Zrip::OutputSizeLimitError) do
+        codec.decompress(compressed, max_output_size: payload.bytesize - 1)
+      end
+      assert_equal payload, codec.decompress(compressed, max_output_size: payload.bytesize)
+    end
+  end
+
+
+  it "no large output string on failed decompress" do
     codec   = Zrip::FrameCodec.new
     size    = 1024 * 1024
     garbage = "\x00".b * size
@@ -191,13 +228,13 @@ class TestDosResistance < Minitest::Test
 end
 
 
-class TestDictionary < Minitest::Test
-  def setup
+describe Zrip::Dictionary do
+  before do
     @bytes = "header version=1 type=message field1=" * 4
   end
 
 
-  def test_stores_bytes_binary_encoded_and_frozen
+  it "stores bytes binary encoded and frozen" do
     d = Zrip::Dictionary.new(bytes: @bytes)
     assert_equal @bytes.b, d.bytes
     assert_predicate d.bytes, :frozen?
@@ -205,7 +242,7 @@ class TestDictionary < Minitest::Test
   end
 
 
-  def test_defaults_id_to_sha256_mapped_into_public_range
+  it "defaults id to sha256 mapped into public range" do
     raw = Digest::SHA256.digest(@bytes)[0, 4].unpack1("V")
     expected = Zrip::Dictionary::USER_DICT_ID_MIN +
       (raw % Zrip::Dictionary::USER_DICT_ID_SIZE)
@@ -213,7 +250,7 @@ class TestDictionary < Minitest::Test
   end
 
 
-  def test_auto_generated_ids_stay_within_public_range
+  it "auto generated ids stay within public range" do
     range = Zrip::Dictionary::USER_DICT_ID_MIN..Zrip::Dictionary::USER_DICT_ID_MAX
     200.times do
       dd = Zrip::Dictionary.new(bytes: Random.bytes(128))
@@ -222,24 +259,24 @@ class TestDictionary < Minitest::Test
   end
 
 
-  def test_accepts_caller_supplied_id
+  it "accepts caller supplied id" do
     d = Zrip::Dictionary.new(bytes: @bytes, id: 0xDEAD_BEEF)
     assert_equal 0xDEAD_BEEF, d.id
   end
 
 
-  def test_size_reports_dict_size_in_bytes
+  it "size reports dict size in bytes" do
     assert_equal @bytes.bytesize, Zrip::Dictionary.new(bytes: @bytes).size
   end
 
 
-  def test_immutability_and_value_equality
+  it "immutability and value equality" do
     assert_predicate Zrip::Dictionary.new(bytes: @bytes), :frozen?
     assert_equal Zrip::Dictionary.new(bytes: @bytes), Zrip::Dictionary.new(bytes: @bytes.dup)
   end
 
 
-  def test_shareable_across_ractors
+  it "shareable across ractors" do
     require_ractor
 
     r = Ractor.new(Zrip::Dictionary.new(bytes: @bytes)) { |d| [d.bytes, d.id] }
@@ -250,31 +287,31 @@ class TestDictionary < Minitest::Test
 end
 
 
-class TestBlockCodecNoDict < Minitest::Test
-  def setup
+describe Zrip::BlockCodec, "without a dictionary" do
+  before do
     @codec = Zrip::BlockCodec.new
   end
 
 
-  def test_has_dict_is_false
+  it "has dict is false" do
     refute_predicate @codec, :has_dict?
   end
 
 
-  def test_round_trips_empty_string
+  it "round trips empty string" do
     ct = @codec.compress("")
     assert_equal "", @codec.decompress(ct)
   end
 
 
-  def test_round_trips_ascii_text
+  it "round trips ascii text" do
     pt = "the quick brown fox jumps over the lazy dog"
     ct = @codec.compress(pt)
     assert_equal pt, @codec.decompress(ct)
   end
 
 
-  def test_round_trips_repetitive_input_and_compresses
+  it "round trips repetitive input and compresses" do
     pt = "A" * 100_000
     ct = @codec.compress(pt)
     assert_operator ct.bytesize, :<, pt.bytesize / 10
@@ -282,7 +319,7 @@ class TestBlockCodecNoDict < Minitest::Test
   end
 
 
-  def test_round_trips_across_size_buckets
+  it "round trips across size buckets" do
     [0, 1, 64, 255, 256, 1024, 4096, 65_536, 1024 * 1024].each do |n|
       pt = Random.bytes(n)
       ct = @codec.compress(pt)
@@ -292,13 +329,13 @@ class TestBlockCodecNoDict < Minitest::Test
   end
 
 
-  def test_emits_binary_encoded_output
+  it "emits binary encoded output" do
     ct = @codec.compress("hello")
     assert_equal Encoding::ASCII_8BIT, ct.encoding
   end
 
 
-  def test_reuses_context_across_many_calls
+  it "reuses context across many calls" do
     500.times do |i|
       pt = "message #{i} " * (1 + i % 10)
       ct = @codec.compress(pt)
@@ -307,24 +344,24 @@ class TestBlockCodecNoDict < Minitest::Test
   end
 
 
-  def test_default_level
+  it "default level" do
     assert_equal Zrip::DEFAULT_LEVEL, @codec.level
   end
 
 
-  def test_size_is_zero_without_dict
+  it "size is zero without dict" do
     assert_equal 0, @codec.size
   end
 end
 
 
-class TestDictTrainer < Minitest::Test
+describe Zrip::DictTrainer do
   def json_msg(i)
     %Q({"ts":"2026-04-27T12:00:00.#{format("%04d", i)}Z","level":"INFO","service":"api-gw","trace":"#{format("%08x", i)}","method":"GET","path":"/v1/users/#{format("%04d", i)}","status":200,"latency_ms":#{10 + i % 490},"region":"us-east-1"})
   end
 
 
-  def test_starts_with_zero_samples
+  it "starts with zero samples" do
     t = Zrip::DictTrainer.new(2048)
     assert_equal 0, t.sample_count
     assert_equal 0, t.total_bytes
@@ -332,7 +369,45 @@ class TestDictTrainer < Minitest::Test
   end
 
 
-  def test_trains_nonempty_dict_from_100_json_samples
+  it "sample coercion can call back into trainer" do
+    trainer = Zrip::DictTrainer.new(2048)
+    sample = Object.new
+    sample.define_singleton_method(:to_str) do
+      trainer.sample_count
+      "training sample"
+    end
+
+    assert_nil trainer.add_sample(sample)
+    assert_equal 1, trainer.sample_count
+    assert_equal 15, trainer.total_bytes
+  end
+
+
+  it "sample coercion preserves throw" do
+    trainer = Zrip::DictTrainer.new(2048)
+    sample = Object.new
+    sample.define_singleton_method(:to_str) { throw :sample, :escaped }
+
+    assert_equal :escaped, catch(:sample) { trainer.add_sample(sample) }
+    assert_equal 0, trainer.sample_count
+    assert_nil trainer.add_sample("usable sample")
+  end
+
+
+  it "sample coercion can consume trainer" do
+    trainer = Zrip::DictTrainer.new(2048)
+    sample = Object.new
+    sample.define_singleton_method(:to_str) do
+      trainer.train
+      "training sample"
+    end
+
+    assert_raises(RuntimeError) { trainer.add_sample(sample) }
+    assert_predicate trainer, :trained?
+  end
+
+
+  it "trains nonempty dict from 100 json samples" do
     t = Zrip::DictTrainer.new(8192)
     100.times { |i| t.add_sample(json_msg(i)) }
     assert_operator t.sample_count, :>, 0
@@ -345,7 +420,7 @@ class TestDictTrainer < Minitest::Test
   end
 
 
-  def test_trained_dict_is_zdict_format
+  it "trained dict is zdict format" do
     t = Zrip::DictTrainer.new(8192)
     200.times { |i| t.add_sample(json_msg(i)) }
     dict = t.train
@@ -355,7 +430,7 @@ class TestDictTrainer < Minitest::Test
   end
 
 
-  def test_trained_dict_improves_frame_codec_compression
+  it "trained dict improves frame codec compression" do
     t = Zrip::DictTrainer.new(8192)
     200.times { |i| t.add_sample(json_msg(i)) }
     dict_bytes = t.train
@@ -371,21 +446,21 @@ class TestDictTrainer < Minitest::Test
   end
 
 
-  def test_returns_empty_dict_with_fewer_than_2_samples
+  it "returns empty dict with fewer than 2 samples" do
     t = Zrip::DictTrainer.new(2048)
     t.add_sample("hello world")
     assert_equal "", t.train
   end
 
 
-  def test_skips_samples_shorter_than_4_bytes
+  it "skips samples shorter than 4 bytes" do
     t = Zrip::DictTrainer.new(2048)
     t.add_sample("hi")
     assert_equal 0, t.sample_count
   end
 
 
-  def test_raises_runtime_error_on_double_train
+  it "raises runtime error on double train" do
     t = Zrip::DictTrainer.new(2048)
     10.times { |i| t.add_sample(json_msg(i)) }
     t.train
@@ -393,7 +468,7 @@ class TestDictTrainer < Minitest::Test
   end
 
 
-  def test_raises_runtime_error_on_add_sample_after_train
+  it "raises runtime error on add sample after train" do
     t = Zrip::DictTrainer.new(2048)
     t.add_sample("hello world")
     t.train
@@ -401,21 +476,21 @@ class TestDictTrainer < Minitest::Test
   end
 
 
-  def test_raises_runtime_error_on_sample_count_after_train
+  it "raises runtime error on sample count after train" do
     t = Zrip::DictTrainer.new(2048)
     t.train
     assert_raises(RuntimeError) { t.sample_count }
   end
 
 
-  def test_raises_runtime_error_on_total_bytes_after_train
+  it "raises runtime error on total bytes after train" do
     t = Zrip::DictTrainer.new(2048)
     t.train
     assert_raises(RuntimeError) { t.total_bytes }
   end
 
 
-  def test_cannot_cross_ractor_boundaries
+  it "cannot cross ractor boundaries" do
     require_ractor
 
     t = Zrip::DictTrainer.new(2048)
@@ -426,8 +501,8 @@ class TestDictTrainer < Minitest::Test
 end
 
 
-class TestFrameCodecWithDict < Minitest::Test
-  def setup
+describe Zrip::FrameCodec, "with a dictionary" do
+  before do
     t = Zrip::DictTrainer.new(8192)
     200.times do |i|
       t.add_sample("user_#{i}@example.com|status=active|tier=gold|region=eu-west-#{i % 4}")
@@ -439,43 +514,58 @@ class TestFrameCodecWithDict < Minitest::Test
   end
 
 
-  def test_uses_dicts_cached_id
+  it "frame codec with dict is ractor shareable" do
+    require_ractor
+    bytes = @dict.bytes.dup
+    codec = Zrip::FrameCodec.new(dict: bytes)
+    refute_predicate bytes, :frozen?
+    bytes.replace("changed")
+    assert Ractor.shareable?(codec)
+    r = Ractor.new(codec) do |shared|
+      input = "shared dictionary payload " * 100
+      shared.decompress(shared.compress(input)) == input
+    end
+    assert_equal true, ractor_value(r)
+  end
+
+
+  it "uses dicts cached id" do
     assert_equal @dict.id, @codec.id
     assert_predicate @codec, :has_dict?
   end
 
 
-  def test_raises_type_error_for_bad_dict
+  it "raises type error for bad dict" do
     assert_raises(TypeError) { Zrip::FrameCodec.new(dict: 42) }
   end
 
 
-  def test_round_trips_message_sharing_dict_prefix
+  it "round trips message sharing dict prefix" do
     msg = "user_4242@example.com|status=active|tier=gold|region=eu-west-1"
     ct  = @codec.compress(msg)
     assert_equal msg, @codec.decompress(ct)
   end
 
 
-  def test_round_trips_random_bytes
+  it "round trips random bytes" do
     msg = Random.bytes(4096)
     assert_equal msg, @codec.decompress(@codec.compress(msg))
   end
 
 
-  def test_round_trips_empty_string
+  it "round trips empty string" do
     ct = @codec.compress("")
     assert_equal "", @codec.decompress(ct)
   end
 
 
-  def test_emits_zstd_frame_magic
+  it "emits zstd frame magic" do
     ct = @codec.compress("user_4242@example.com|status=active|tier=gold|region=eu-west-1")
     assert_equal [0x28, 0xB5, 0x2F, 0xFD], ct.bytes.first(4)
   end
 
 
-  def test_raises_on_dict_mismatch
+  it "raises on dict mismatch" do
     t2 = Zrip::DictTrainer.new(8192)
     200.times { |i| t2.add_sample("totally different content #{i}" * 5) }
     other_dict = Zrip::Dictionary.new(bytes: t2.train)
@@ -485,12 +575,12 @@ class TestFrameCodecWithDict < Minitest::Test
   end
 
 
-  def test_raises_on_garbage_input
+  it "raises on garbage input" do
     assert_raises(Zrip::DecompressError) { @codec.decompress("garbage") }
   end
 
 
-  def test_dict_compresses_better
+  it "dict compresses better" do
     msg = "user_4242@example.com|status=active|tier=gold|region=eu-west-1"
     ct_with = @codec.compress(msg)
     ct_without = @no_dict.compress(msg)
@@ -499,8 +589,8 @@ class TestFrameCodecWithDict < Minitest::Test
 end
 
 
-class TestBlockCodecWithDict < Minitest::Test
-  def setup
+describe Zrip::BlockCodec, "with a dictionary" do
+  before do
     t = Zrip::DictTrainer.new(8192)
     200.times do |i|
       t.add_sample("user_#{i}@example.com|status=active|tier=gold|region=eu-west-#{i % 4}")
@@ -512,19 +602,19 @@ class TestBlockCodecWithDict < Minitest::Test
   end
 
 
-  def test_has_dict_is_true
+  it "has dict is true" do
     assert_predicate @codec, :has_dict?
   end
 
 
-  def test_round_trips
+  it "round trips" do
     msg = "user_4242@example.com|status=active|tier=gold|region=eu-west-1"
     ct  = @codec.compress(msg)
     assert_equal msg, @codec.decompress(ct)
   end
 
 
-  def test_dict_compresses_better
+  it "dict compresses better" do
     msg = "user_4242@example.com|status=active|tier=gold|region=eu-west-1"
     ct_with    = @codec.compress(msg)
     ct_without = @no_dict.compress(msg)
@@ -532,7 +622,7 @@ class TestBlockCodecWithDict < Minitest::Test
   end
 
 
-  def test_reuses_context_500_times
+  it "reuses context 500 times" do
     msgs = 500.times.map { |i| "user_#{i}@example.com|status=active" }
     ciphertexts = msgs.map { |m| @codec.compress(m) }
     msgs.zip(ciphertexts).each do |msg, ct|
@@ -542,13 +632,13 @@ class TestBlockCodecWithDict < Minitest::Test
 end
 
 
-class TestRactorSafety < Minitest::Test
-  def setup
+describe "Zrip Ractor safety" do
+  before do
     require_ractor
   end
 
 
-  def test_compress_decompress_inside_ractor
+  it "compress decompress inside ractor" do
     r = Ractor.new do
       codec = Zrip::FrameCodec.new
       pt    = "hello from inside a ractor " * 100
@@ -561,7 +651,7 @@ class TestRactorSafety < Minitest::Test
   end
 
 
-  def test_dictionary_shareable_across_ractors
+  it "dictionary shareable across ractors" do
     dict = Zrip::Dictionary.new(bytes: "shared dict prefix " * 4)
     r = Ractor.new(dict) do |d|
       [d.bytes, d.id]
@@ -572,7 +662,24 @@ class TestRactorSafety < Minitest::Test
   end
 
 
-  def test_block_codec_is_per_ractor
+  it "shares one frame codec across ractors" do
+    codec = Zrip::FrameCodec.new
+    assert_predicate codec, :frozen?
+    assert Ractor.shareable?(codec)
+    ractors = 4.times.map do |i|
+      Ractor.new(codec, i) do |shared, index|
+        input = "shared payload #{index} " * 20_000
+        10.times do
+          raise "round trip mismatch" unless shared.decompress(shared.compress(input)) == input
+        end
+        :ok
+      end
+    end
+    assert_equal [:ok] * 4, ractors.map { |ractor| ractor_value(ractor) }
+  end
+
+
+  it "block codec is per ractor" do
     r = Ractor.new do
       c   = Zrip::BlockCodec.new
       msg = "ractor local payload " * 50
@@ -583,7 +690,7 @@ class TestRactorSafety < Minitest::Test
   end
 
 
-  def test_block_codec_cannot_cross_ractor_boundaries
+  it "block codec cannot cross ractor boundaries" do
     codec = Zrip::BlockCodec.new
     assert_raises(TypeError, Ractor::IsolationError) do
       Ractor.new(codec) { |c| c.compress("payload") }
@@ -591,7 +698,7 @@ class TestRactorSafety < Minitest::Test
   end
 
 
-  def test_multiple_ractors_compress_in_parallel
+  it "multiple ractors compress in parallel" do
     ractors = 4.times.map do |i|
       Ractor.new(i) do |idx|
         codec = Zrip::FrameCodec.new
@@ -605,5 +712,121 @@ class TestRactorSafety < Minitest::Test
     end
     results = ractors.map { |r| ractor_value(r) }
     assert_equal [:ok, :ok, :ok, :ok], results
+  end
+end
+
+
+describe "Zrip native interruptions" do
+  it "interrupted compression unlocks input and releases codec" do
+    interrupted_error = Class.new(StandardError)
+    skip "requires MRI GVL" unless RUBY_ENGINE == "ruby"
+
+    codecs = [Zrip::FrameCodec.new, Zrip::BlockCodec.new]
+    codecs.each do |codec|
+      input = Random.bytes(16 * 1024 * 1024)
+      worker = Thread.new do
+        codec.compress(input)
+      rescue interrupted_error => error
+        error
+      end
+      worker.report_on_exception = false
+
+      begin
+        assert wait_for_input_lock(input, worker), "compression did not lock input"
+        worker.raise(interrupted_error)
+        assert_instance_of interrupted_error, worker.value
+        input.replace("usable")
+        assert_equal "usable", input
+        assert_equal input, decompress(codec, codec.compress(input), input.bytesize)
+      ensure
+        worker.kill if worker.alive?
+        worker.join
+      end
+    end
+  end
+
+
+  it "killed compression unlocks input" do
+    skip "requires MRI GVL" unless RUBY_ENGINE == "ruby"
+
+    codec = Zrip::FrameCodec.new
+    input = Random.bytes(64 * 1024 * 1024)
+    worker = Thread.new { codec.compress(input) }
+    worker.report_on_exception = false
+    begin
+      assert wait_for_input_lock(input, worker), "compression did not lock input"
+      worker.kill
+      assert_nil worker.value
+      input.replace("usable")
+      assert_equal "usable", input
+    ensure
+      worker.kill if worker.alive?
+      worker.join
+    end
+  end
+
+
+  it "contended small compression locks input" do
+    skip "requires MRI GVL" unless RUBY_ENGINE == "ruby"
+
+    codec = Zrip::FrameCodec.new
+    large_input = Random.bytes(128 * 1024 * 1024)
+    small_input = +"small mutable input"
+    large_worker = Thread.new { codec.compress(large_input) }
+    small_worker = nil
+
+    begin
+      assert wait_for_input_lock(large_input, large_worker), "large compression did not lock input"
+      small_worker = Thread.new { codec.compress(small_input) }
+      assert wait_for_input_lock(small_input, small_worker), "contended small input was not locked"
+      assert_raises(RuntimeError) { small_input.replace("changed") }
+      small_compressed = small_worker.value
+      large_worker.value
+      assert_equal small_input, decompress(codec, small_compressed, small_input.bytesize)
+      small_input.replace("usable")
+      assert_equal "usable", small_input
+    ensure
+      [small_worker, large_worker].compact.each do |worker|
+        worker.kill if worker.alive?
+        worker.join
+      end
+    end
+  end
+
+  private
+
+  def decompress(codec, compressed, size)
+    codec.decompress(compressed)
+  end
+
+  def wait_for_input_lock(input, worker)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    while worker.alive? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      begin
+        input.setbyte(0, input.getbyte(0))
+      rescue RuntimeError
+        return true
+      end
+      Thread.pass
+    end
+    false
+  end
+end
+
+
+describe "Zrip native coercion" do
+  it "decompression borrows input after size coercion" do
+    [Zrip::FrameCodec.new, Zrip::BlockCodec.new].each do |codec|
+      input = codec.compress("old")
+      expected = "replacement payload " * 500
+      size = Object.new
+      size.define_singleton_method(:to_int) do
+        input.replace(codec.compress(expected))
+        expected.bytesize
+      end
+
+      actual = codec._native_decompress(input, size)
+      assert_equal expected, actual
+    end
   end
 end
