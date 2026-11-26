@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-26
+
 - `FrameCodec#level=` and `BlockCodec#level=` switch later frames to a new
   level. A dictionary stays loaded; zrip prepares it again for the level.
 - `FrameCodec#take_stats` and `BlockCodec#take_stats` return the bytes in
