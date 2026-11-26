@@ -116,8 +116,11 @@ fn decompress_bounded(
     }
 
     let limit = max_output.unwrap_or(usize::MAX);
-    dctx.decompress_with_limit(compressed, limit)
-        .map(|out| out.into_owned())
+    // A fresh buffer per frame: the context's own one would keep the largest
+    // frame's size for the codec's lifetime.
+    let mut out = Vec::new();
+    dctx.decompress_into_with_limit(compressed, &mut out, limit)
+        .map(|_| out)
         .map_err(|err| match err {
             zstd::DecompressError::OutputTooSmall => BoundedError::OutputSizeLimit {
                 limit: limit as u64,

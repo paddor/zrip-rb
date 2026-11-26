@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- `FrameCodec#decompress` and `BlockCodec#decompress` decode into a new
+  buffer per call. The codec kept a buffer the size of its largest frame
+  for its lifetime, and copied each frame out of it.
+
 ## [0.2.2] - 2026-11-26
 
 - Update the `zrip` crate dependency to 0.8.29. Levels are retuned, so
