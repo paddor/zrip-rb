@@ -28,6 +28,12 @@ module Zrip
   #   @return [String]
   #   @raise [CompressError]
   #
+  # @!method level=(level)
+  #   Compress later frames at `level`. A dictionary stays loaded.
+  #   @param level [Integer] compression level
+  #   @return [Integer]
+  #   @raise [ArgumentError] for a level zrip lacks
+  #
   # @!method decompress(bytes, max_output_size: nil)
   #   Decompress a Zstandard frame.
   #   @param bytes [String] compressed Zstandard frame
@@ -70,6 +76,18 @@ module Zrip
 
     def decompress(bytes, max_output_size: nil)
       _native_decompress(bytes, max_output_size && Integer(max_output_size))
+    end
+
+
+    # Returns the compression work since the last call and resets it.
+    # `busy` is the time spent compressing, measured natively, so it leaves
+    # out waits for the GVL.
+    #
+    # @return [Hash{Symbol => Numeric}] `{plain:, compressed:, busy:}` in
+    #   bytes and seconds
+    def take_stats
+      plain, compressed, busy_ns = _take_stats
+      { plain: plain, compressed: compressed, busy: busy_ns / 1e9 }
     end
   end
 end

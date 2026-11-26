@@ -427,6 +427,18 @@ pub fn value_to_i32(value: VALUE) -> RbResult<i32> {
     i32::try_from(out).map_err(|_| RubyErr::arg("integer too large"))
 }
 
+pub fn value_to_u64(value: VALUE) -> RbResult<u64> {
+    Ok(value_to_usize(value)? as u64)
+}
+
+pub fn u64_value(value: u64) -> RbResult<VALUE> {
+    protect_value(|| unsafe { rb_sys::rb_ull2inum(value) })
+}
+
+pub fn new_array(values: &[VALUE]) -> RbResult<VALUE> {
+    protect_value(|| unsafe { rb_sys::rb_ary_new_from_values(values.len() as _, values.as_ptr()) })
+}
+
 pub fn usize_value(value: usize) -> RbResult<VALUE> {
     protect_value(|| unsafe { rb_sys::rb_ull2inum(value as u64) })
 }
@@ -585,6 +597,27 @@ pub unsafe fn define_method_2(
     protect_unit(|| unsafe {
         rb_sys::rb_define_method(class, name.as_ptr(), Some(transmute_2(func)), 2)
     })
+}
+
+pub unsafe fn define_method_4(
+    class: VALUE,
+    name: &CStr,
+    func: unsafe extern "C" fn(VALUE, VALUE, VALUE, VALUE, VALUE) -> VALUE,
+) -> RbResult<()> {
+    protect_unit(|| unsafe {
+        rb_sys::rb_define_method(class, name.as_ptr(), Some(transmute_4(func)), 4)
+    })
+}
+
+unsafe fn transmute_4(
+    func: unsafe extern "C" fn(VALUE, VALUE, VALUE, VALUE, VALUE) -> VALUE,
+) -> unsafe extern "C" fn() -> VALUE {
+    unsafe {
+        std::mem::transmute::<
+            unsafe extern "C" fn(VALUE, VALUE, VALUE, VALUE, VALUE) -> VALUE,
+            unsafe extern "C" fn() -> VALUE,
+        >(func)
+    }
 }
 
 unsafe fn transmute_0(
