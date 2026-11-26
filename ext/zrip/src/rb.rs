@@ -427,6 +427,14 @@ pub fn value_to_i32(value: VALUE) -> RbResult<i32> {
     i32::try_from(out).map_err(|_| RubyErr::arg("integer too large"))
 }
 
+pub fn u64_value(value: u64) -> RbResult<VALUE> {
+    protect_value(|| unsafe { rb_sys::rb_ull2inum(value) })
+}
+
+pub fn new_array(values: &[VALUE]) -> RbResult<VALUE> {
+    protect_value(|| unsafe { rb_sys::rb_ary_new_from_values(values.len() as _, values.as_ptr()) })
+}
+
 pub fn usize_value(value: usize) -> RbResult<VALUE> {
     protect_value(|| unsafe { rb_sys::rb_ull2inum(value as u64) })
 }

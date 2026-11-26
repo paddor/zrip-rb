@@ -878,3 +878,55 @@ describe "Zrip native coercion" do
     end
   end
 end
+
+
+describe "Zrip codec levels and stats" do
+  before do
+    t = Zrip::DictTrainer.new(8192)
+    200.times do |i|
+      t.add_sample("user_#{i}@example.com|status=active|tier=gold|region=eu-west-#{i % 4}")
+    end
+    @dict = Zrip::Dictionary.new(bytes: t.train)
+    @msg  = "user_77@example.com|status=active|tier=gold|region=eu-west-1".b
+  end
+
+
+  [Zrip::FrameCodec, Zrip::BlockCodec].each do |klass|
+    it "#{klass}#level= changes the level for later frames" do
+      codec = klass.new(level: -3)
+      codec.level = 3
+      assert_equal 3, codec.level
+      data = ("the quick brown fox " * 2000).b
+      assert_equal data, codec.decompress(codec.compress(data))
+    end
+
+
+    it "#{klass}#level= rejects a level zrip lacks" do
+      codec = klass.new
+      assert_raises(ArgumentError) { codec.level = 9 }
+      assert_equal Zrip::DEFAULT_LEVEL, codec.level
+    end
+
+
+    it "#{klass}#level= keeps the dictionary" do
+      codec   = klass.new(dict: @dict, level: -3)
+      plain   = klass.new(level: 3)
+      codec.level = 3
+      frame = codec.compress(@msg)
+      assert_equal @msg, klass.new(dict: @dict).decompress(frame)
+      assert_operator frame.bytesize, :<, plain.compress(@msg).bytesize
+    end
+
+
+    it "#{klass}#take_stats returns the work since the last call" do
+      codec = klass.new
+      inputs = [("a" * 10_000).b, Random.bytes(5_000)]
+      frames = inputs.map { |input| codec.compress(input) }
+      stats  = codec.take_stats
+      assert_equal inputs.sum(&:bytesize), stats[:plain]
+      assert_equal frames.sum(&:bytesize), stats[:compressed]
+      assert_operator stats[:busy], :>, 0
+      assert_equal({ plain: 0, compressed: 0, busy: 0.0 }, codec.take_stats)
+    end
+  end
+end

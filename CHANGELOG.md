@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- `FrameCodec#level=` and `BlockCodec#level=` switch later frames to a new
+  level. A dictionary stays loaded; zrip prepares it again for the level.
+- `FrameCodec#take_stats` and `BlockCodec#take_stats` return the bytes in
+  and out and the time spent compressing since the last call. The time is
+  measured natively around each compression, so it leaves out waits for the
+  GVL and the codec lock.
 - `FrameCodec#decompress` and `BlockCodec#decompress` decode into a new
   buffer per call. The codec kept a buffer the size of its largest frame
   for its lifetime, and copied each frame out of it.

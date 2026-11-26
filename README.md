@@ -59,6 +59,7 @@ original   = codec.decompress(compressed)
 ```ruby
 fast   = Zrip::FrameCodec.new(level: -3)   # negative = faster
 strong = Zrip::FrameCodec.new(level: 4)    # highest supported level
+fast.level = 1                             # later frames; a dictionary stays loaded
 ```
 
 ### Bounded decompression

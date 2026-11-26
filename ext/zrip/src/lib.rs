@@ -2,7 +2,9 @@ mod rb;
 
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
+use std::time::{Duration, Instant};
 
 use rb_sys::{rb_data_type_struct__bindgen_ty_1, rb_data_type_t, size_t, VALUE};
 use zstd::dict::fastcover::FastCoverParams;
@@ -84,6 +86,76 @@ where
         }
         Err(TryLockError::Poisoned(_)) => Err(RubyErr::runtime(format!("{name} mutex poisoned"))),
     }
+}
+
+/// Compression work since the last `#take_stats`. `busy` is measured around
+/// the compression itself, so it leaves out waits for the GVL and the lock.
+#[derive(Default)]
+struct CompressStats {
+    plain: AtomicU64,
+    compressed: AtomicU64,
+    busy_ns: AtomicU64,
+}
+
+impl CompressStats {
+    fn record(&self, plain: usize, compressed: usize, busy: Duration) {
+        self.plain.fetch_add(plain as u64, Ordering::Relaxed);
+        self.compressed
+            .fetch_add(compressed as u64, Ordering::Relaxed);
+        let busy_ns = u64::try_from(busy.as_nanos()).unwrap_or(u64::MAX);
+        self.busy_ns.fetch_add(busy_ns, Ordering::Relaxed);
+    }
+
+    /// Returns `[plain, compressed, busy_ns]` and resets them.
+    fn take(&self) -> RbResult<VALUE> {
+        rb::new_array(&[
+            rb::u64_value(self.plain.swap(0, Ordering::Relaxed))?,
+            rb::u64_value(self.compressed.swap(0, Ordering::Relaxed))?,
+            rb::u64_value(self.busy_ns.swap(0, Ordering::Relaxed))?,
+        ])
+    }
+}
+
+/// Compresses `input` and records the work in `stats`.
+fn compress_recorded(
+    cctx: &mut CompressContext,
+    stats: &CompressStats,
+    input: &[u8],
+) -> RbResult<Vec<u8>> {
+    let start = Instant::now();
+    let frame = cctx
+        .compress(input)
+        .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))?;
+    let busy = start.elapsed();
+    stats.record(input.len(), frame.len(), busy);
+    Ok(frame.into_owned())
+}
+
+/// Switches `cctx` to `rb_level` for later frames. A dictionary stays loaded;
+/// zrip prepares it again for the new level.
+fn set_level(
+    cctx: &Mutex<CompressContext>,
+    level: &AtomicI32,
+    rb_level: VALUE,
+    name: &str,
+) -> RbResult<VALUE> {
+    let new_level = rb::value_to_i32(rb_level)?;
+    let apply = |cctx: &mut CompressContext| {
+        cctx.set_level(new_level)
+            .map_err(|e| RubyErr::arg(format!("zrip level {new_level}: {e}")))
+    };
+    let poisoned = || RubyErr::runtime(format!("{name} mutex poisoned"));
+    match cctx.try_lock() {
+        Ok(mut guard) => apply(&mut guard)?,
+        // A compression holds it without the GVL: wait without it as well.
+        Err(TryLockError::WouldBlock) => rb::maybe_without_gvl(true, || {
+            let mut guard = cctx.lock().map_err(|_| poisoned())?;
+            apply(&mut guard)
+        })??,
+        Err(TryLockError::Poisoned(_)) => return Err(poisoned()),
+    }
+    level.store(new_level, Ordering::Relaxed);
+    Ok(rb::i32_value(new_level))
 }
 
 // ---------- frame header parsing ----------
@@ -299,9 +371,10 @@ unsafe fn dict_trainer_ref(value: VALUE) -> RbResult<&'static RbDictTrainer> {
 struct FrameCodec {
     dict_len: usize,
     dict_id: Option<u32>,
-    level: i32,
+    level: AtomicI32,
     cctx: Mutex<CompressContext>,
     dctx: Mutex<DecompressContext>,
+    stats: CompressStats,
 }
 
 unsafe impl Send for FrameCodec {}
@@ -341,9 +414,10 @@ fn frame_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
             Box::new(FrameCodec {
                 dict_len,
                 dict_id,
-                level,
+                level: AtomicI32::new(level),
                 cctx: Mutex::new(cctx),
                 dctx: Mutex::new(dctx),
+                stats: CompressStats::default(),
             }),
             frame_codec_data_type(),
         )?
@@ -361,11 +435,7 @@ fn frame_codec_compress_impl(rb_self: VALUE, rb_input: VALUE) -> RbResult<VALUE>
         release_gvl,
         "FrameCodec CCtx",
         &mut input,
-        |cctx, input| {
-            cctx.compress(input)
-                .map(|out| out.into_owned())
-                .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))
-        },
+        |cctx, input| compress_recorded(cctx, &rb_self.stats, input),
     )?;
     rb::new_binary_string(&out)
 }
@@ -412,7 +482,7 @@ fn frame_codec_id_impl(rb_self: VALUE) -> RbResult<VALUE> {
 
 fn frame_codec_level_impl(rb_self: VALUE) -> RbResult<VALUE> {
     let rb_self = unsafe { frame_codec_ref(rb_self)? };
-    Ok(rb::i32_value(rb_self.level))
+    Ok(rb::i32_value(rb_self.level.load(Ordering::Relaxed)))
 }
 
 fn frame_codec_get_frame_content_size_impl(rb_input: VALUE) -> RbResult<VALUE> {
@@ -460,6 +530,24 @@ unsafe extern "C" fn frame_codec_id(rb_self: VALUE) -> VALUE {
     rb::wrap(|| frame_codec_id_impl(rb_self))
 }
 
+fn frame_codec_set_level_impl(rb_self: VALUE, rb_level: VALUE) -> RbResult<VALUE> {
+    let rb_self = unsafe { frame_codec_ref(rb_self)? };
+    set_level(&rb_self.cctx, &rb_self.level, rb_level, "FrameCodec CCtx")
+}
+
+fn frame_codec_take_stats_impl(rb_self: VALUE) -> RbResult<VALUE> {
+    let rb_self = unsafe { frame_codec_ref(rb_self)? };
+    rb_self.stats.take()
+}
+
+unsafe extern "C" fn frame_codec_set_level(rb_self: VALUE, rb_level: VALUE) -> VALUE {
+    rb::wrap(|| frame_codec_set_level_impl(rb_self, rb_level))
+}
+
+unsafe extern "C" fn frame_codec_take_stats(rb_self: VALUE) -> VALUE {
+    rb::wrap(|| frame_codec_take_stats_impl(rb_self))
+}
+
 unsafe extern "C" fn frame_codec_level(rb_self: VALUE) -> VALUE {
     rb::wrap(|| frame_codec_level_impl(rb_self))
 }
@@ -473,9 +561,10 @@ unsafe extern "C" fn frame_codec_get_frame_content_size(_class: VALUE, rb_input:
 struct BlockCodec {
     dict_len: usize,
     dict_id: Option<u32>,
-    level: i32,
+    level: AtomicI32,
     cctx: Mutex<CompressContext>,
     dctx: Mutex<DecompressContext>,
+    stats: CompressStats,
 }
 
 fn block_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -> RbResult<VALUE> {
@@ -512,9 +601,10 @@ fn block_codec_new_impl(class: VALUE, rb_dict: VALUE, id: VALUE, level: VALUE) -
             Box::new(BlockCodec {
                 dict_len,
                 dict_id,
-                level,
+                level: AtomicI32::new(level),
                 cctx: Mutex::new(cctx),
                 dctx: Mutex::new(dctx),
+                stats: CompressStats::default(),
             }),
             block_codec_data_type(),
         )
@@ -530,11 +620,7 @@ fn block_codec_compress_impl(rb_self: VALUE, rb_input: VALUE) -> RbResult<VALUE>
         release_gvl,
         "BlockCodec CCtx",
         &mut input,
-        |cctx, input| {
-            cctx.compress(input)
-                .map(|out| out.into_owned())
-                .map_err(|e| RubyErr::new(compress_error(), format!("zstd compress failed: {e}")))
-        },
+        |cctx, input| compress_recorded(cctx, &rb_self.stats, input),
     )?;
     rb::new_binary_string(&out)
 }
@@ -572,7 +658,7 @@ fn block_codec_has_dict_impl(rb_self: VALUE) -> RbResult<VALUE> {
 
 fn block_codec_level_impl(rb_self: VALUE) -> RbResult<VALUE> {
     let rb_self = unsafe { block_codec_ref(rb_self)? };
-    Ok(rb::i32_value(rb_self.level))
+    Ok(rb::i32_value(rb_self.level.load(Ordering::Relaxed)))
 }
 
 unsafe extern "C" fn block_codec_new(
@@ -602,6 +688,24 @@ unsafe extern "C" fn block_codec_size(rb_self: VALUE) -> VALUE {
 
 unsafe extern "C" fn block_codec_has_dict(rb_self: VALUE) -> VALUE {
     rb::wrap(|| block_codec_has_dict_impl(rb_self))
+}
+
+fn block_codec_set_level_impl(rb_self: VALUE, rb_level: VALUE) -> RbResult<VALUE> {
+    let rb_self = unsafe { block_codec_ref(rb_self)? };
+    set_level(&rb_self.cctx, &rb_self.level, rb_level, "BlockCodec CCtx")
+}
+
+fn block_codec_take_stats_impl(rb_self: VALUE) -> RbResult<VALUE> {
+    let rb_self = unsafe { block_codec_ref(rb_self)? };
+    rb_self.stats.take()
+}
+
+unsafe extern "C" fn block_codec_set_level(rb_self: VALUE, rb_level: VALUE) -> VALUE {
+    rb::wrap(|| block_codec_set_level_impl(rb_self, rb_level))
+}
+
+unsafe extern "C" fn block_codec_take_stats(rb_self: VALUE) -> VALUE {
+    rb::wrap(|| block_codec_take_stats_impl(rb_self))
 }
 
 unsafe extern "C" fn block_codec_level(rb_self: VALUE) -> VALUE {
@@ -815,6 +919,8 @@ fn init() -> RbResult<()> {
         rb::define_method_0(frame_codec_class, c"has_dict?", frame_codec_has_dict)?;
         rb::define_method_0(frame_codec_class, c"id", frame_codec_id)?;
         rb::define_method_0(frame_codec_class, c"level", frame_codec_level)?;
+        rb::define_method_1(frame_codec_class, c"level=", frame_codec_set_level)?;
+        rb::define_method_0(frame_codec_class, c"_take_stats", frame_codec_take_stats)?;
     }
 
     let block_codec_class =
@@ -831,6 +937,8 @@ fn init() -> RbResult<()> {
         rb::define_method_0(block_codec_class, c"size", block_codec_size)?;
         rb::define_method_0(block_codec_class, c"has_dict?", block_codec_has_dict)?;
         rb::define_method_0(block_codec_class, c"level", block_codec_level)?;
+        rb::define_method_1(block_codec_class, c"level=", block_codec_set_level)?;
+        rb::define_method_0(block_codec_class, c"_take_stats", block_codec_take_stats)?;
     }
 
     let trainer_class =
