@@ -1,3 +1,4 @@
+mod adaptive;
 mod rb;
 
 use std::ffi::c_void;
@@ -940,6 +941,8 @@ fn init() -> RbResult<()> {
         rb::define_method_1(block_codec_class, c"level=", block_codec_set_level)?;
         rb::define_method_0(block_codec_class, c"_take_stats", block_codec_take_stats)?;
     }
+
+    adaptive::define(module)?;
 
     let trainer_class =
         unsafe { rb::define_class_under(module, c"DictTrainer", rb_sys::rb_cObject)? };

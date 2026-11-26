@@ -62,6 +62,22 @@ strong = Zrip::FrameCodec.new(level: 4)    # highest supported level
 fast.level = 1                             # later frames; a dictionary stays loaded
 ```
 
+### Adaptive level
+
+`AdaptiveLevel` walks the levels of a range, one step per window of work,
+toward ratio when output stalls or the CPU idles and toward speed when the CPU
+is the limit. `#take_stats` reports a codec's work since the last call, with
+the compression time measured natively, so waits for the GVL don't count.
+
+```ruby
+codec    = Zrip::FrameCodec.new(level: -1)
+adaptive = Zrip::AdaptiveLevel.new(-7..4, start: -1)
+
+# once per window, e.g. every 100 ms
+stats       = codec.take_stats   #=> {plain: 1048576, compressed: 312000, busy: 0.004}
+codec.level = adaptive.update(**stats, bottleneck: :output) # or :cpu, :input, nil
+```
+
 ### Bounded decompression
 
 ```ruby

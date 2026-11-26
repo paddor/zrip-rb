@@ -930,3 +930,36 @@ describe "Zrip codec levels and stats" do
     end
   end
 end
+
+
+describe Zrip::AdaptiveLevel do
+  it "starts at the first level not below start, -1 by default" do
+    assert_equal(-1, Zrip::AdaptiveLevel.new(-7..4).level)
+    assert_equal(-1, Zrip::AdaptiveLevel.new(-7..4, start: -1).level)
+    assert_equal 1, Zrip::AdaptiveLevel.new(1..4, start: -1).level
+    assert_equal(-3, Zrip::AdaptiveLevel.new(-7...-2, start: -1).level)
+  end
+
+
+  it "rejects a range without zrip levels" do
+    assert_raises(ArgumentError) { Zrip::AdaptiveLevel.new(10..20, start: 10) }
+    assert_raises(ArgumentError) { Zrip::AdaptiveLevel.new(4..1, start: 1) }
+    assert_raises(ArgumentError) { Zrip::AdaptiveLevel.new("a".."b", start: 1) }
+  end
+
+
+  it "steps toward ratio for slow output and toward speed for a busy CPU" do
+    window = { plain: 1 << 20, compressed: 1 << 19, busy: 0.01 }
+    assert_operator Zrip::AdaptiveLevel.new(-7..4, start: -1).update(**window, bottleneck: :output), :>, -1
+    assert_operator Zrip::AdaptiveLevel.new(-7..4, start: -1).update(**window, bottleneck: :cpu), :<, -1
+    assert_equal(-1, Zrip::AdaptiveLevel.new(-7..4, start: -1).update(**window, bottleneck: nil))
+    assert_equal(-1, Zrip::AdaptiveLevel.new(-7..4).update(**window))
+  end
+
+
+  it "rejects an unknown bottleneck" do
+    assert_raises(ArgumentError) do
+      Zrip::AdaptiveLevel.new(-7..4, start: -1).update(plain: 1, compressed: 1, busy: 0.0, bottleneck: :disk)
+    end
+  end
+end

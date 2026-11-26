@@ -8,6 +8,9 @@
   and out and the time spent compressing since the last call. The time is
   measured natively around each compression, so it leaves out waits for the
   GVL and the codec lock.
+- `Zrip::AdaptiveLevel.new(range, start: -1)` wraps zrip's adaptive level:
+  `#update(plain:, compressed:, busy:, bottleneck: nil)` takes one window's
+  stats and what limited the sender, and returns the next level.
 - `FrameCodec#decompress` and `BlockCodec#decompress` decode into a new
   buffer per call. The codec kept a buffer the size of its largest frame
   for its lifetime, and copied each frame out of it.
