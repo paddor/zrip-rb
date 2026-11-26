@@ -61,7 +61,7 @@ where
     F: FnOnce(&mut T, &[u8]) -> RbResult<R>,
 {
     if release_gvl {
-        input.lock_for_without_gvl(true)?;
+        input.freeze_for_without_gvl(true)?;
         return rb::maybe_without_gvl(true, || {
             let mut guard = mutex
                 .lock()
@@ -74,7 +74,7 @@ where
         Ok(mut guard) => func(&mut guard, input.as_slice()),
         Err(TryLockError::WouldBlock) => {
             // Even a small input needs protection when contention releases GVL.
-            input.lock_for_without_gvl(true)?;
+            input.freeze_for_without_gvl(true)?;
             rb::maybe_without_gvl(true, || {
                 let mut guard = mutex
                     .lock()
@@ -108,33 +108,31 @@ fn parse_frame_content_size(input: &[u8]) -> Result<Option<u64>, BoundedError> {
 
 fn decompress_bounded(
     compressed: &[u8],
-    max_output: usize,
+    max_output: Option<usize>,
     dctx: &mut DecompressContext,
 ) -> Result<Vec<u8>, BoundedError> {
     if compressed.len() < ZSTD_FRAME_MAGIC.len() || compressed[..4] != ZSTD_FRAME_MAGIC {
         return Err(BoundedError::BadMagic);
     }
 
-    let limit = if max_output == 0 {
-        usize::MAX
-    } else {
-        max_output
-    };
+    let limit = max_output.unwrap_or(usize::MAX);
     dctx.decompress_with_limit(compressed, limit)
         .map(|out| out.into_owned())
         .map_err(|err| match err {
             zstd::DecompressError::OutputTooSmall => BoundedError::OutputSizeLimit {
-                limit: max_output as u64,
+                limit: limit as u64,
             },
             _ => BoundedError::DecoderFailed(err.to_string()),
         })
 }
 
-fn decompress_work_size(compressed: &[u8], max_output: usize) -> usize {
+fn decompress_work_size(compressed: &[u8], max_output: Option<usize>) -> usize {
+    let limit = max_output.unwrap_or(usize::MAX);
     match parse_frame_content_size(compressed) {
-        Ok(Some(n)) => usize::try_from(n).unwrap_or(usize::MAX),
-        Ok(None) if max_output != 0 => max_output,
-        _ => compressed.len(),
+        Ok(Some(n)) => usize::try_from(n).unwrap_or(usize::MAX).min(limit),
+        Ok(None) => max_output.unwrap_or(compressed.len()),
+        // The decoder rejects the first frame header without decoding.
+        Err(_) => 0,
     }
 }
 
@@ -375,7 +373,7 @@ fn frame_codec_decompress_impl(
     max_output: VALUE,
 ) -> RbResult<VALUE> {
     let rb_self = unsafe { frame_codec_ref(rb_self)? };
-    let max_output = rb::value_to_usize(max_output)?;
+    let max_output = rb::value_to_option_usize(max_output)?;
     let mut compressed = rb::input_bytes(rb_input)?;
     let release_gvl = should_release_frame_decompress_gvl(decompress_work_size(
         compressed.as_slice(),
@@ -544,7 +542,7 @@ fn block_codec_decompress_impl(
     max_output: VALUE,
 ) -> RbResult<VALUE> {
     let rb_self = unsafe { block_codec_ref(rb_self)? };
-    let max_output = rb::value_to_usize(max_output)?;
+    let max_output = rb::value_to_option_usize(max_output)?;
     let mut compressed = rb::input_bytes(rb_input)?;
     let out = with_mutex(
         &rb_self.dctx,
@@ -620,7 +618,8 @@ struct TrainerState {
 }
 
 fn dict_trainer_new_impl(class: VALUE, max_dict_size: VALUE) -> RbResult<VALUE> {
-    let max_dict_size = rb::value_to_usize(max_dict_size)?;
+    // The trainer gives a MIN_DICT_SIZE dict for smaller sizes.
+    let max_dict_size = rb::value_to_usize(max_dict_size)?.max(zstd::dict::MIN_DICT_SIZE);
     unsafe {
         rb::wrap_typed_data(
             class,
@@ -893,14 +892,30 @@ mod tests {
         compressed.extend_from_slice(&zstd::compress(&[b'b'; 100], 1).unwrap());
 
         assert!(matches!(
-            decompress_bounded(&compressed, 199, &mut dctx),
+            decompress_bounded(&compressed, Some(199), &mut dctx),
             Err(BoundedError::OutputSizeLimit { .. })
         ));
         assert_eq!(
-            decompress_bounded(&compressed, 200, &mut dctx)
+            decompress_bounded(&compressed, Some(200), &mut dctx)
                 .unwrap()
                 .len(),
             200
         );
+    }
+
+    #[test]
+    fn bounded_decompress_treats_zero_as_limit() {
+        let mut dctx = DecompressContext::new();
+        let empty = zstd::compress(b"", 1).unwrap();
+        let one = zstd::compress(b"a", 1).unwrap();
+
+        assert!(decompress_bounded(&empty, Some(0), &mut dctx)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            decompress_bounded(&one, Some(0), &mut dctx),
+            Err(BoundedError::OutputSizeLimit { limit: 0 })
+        ));
+        assert_eq!(decompress_bounded(&one, None, &mut dctx).unwrap(), b"a");
     }
 }

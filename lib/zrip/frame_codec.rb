@@ -45,7 +45,7 @@ module Zrip
   # @!method _native_decompress(bytes, max_output_size)
   #   Native decompression entry used by #decompress.
   #   @param bytes [String] compressed Zstandard frame
-  #   @param max_output_size [Integer] output byte limit, or `0` for unbounded
+  #   @param max_output_size [Integer, nil] output byte limit, or `nil` for unbounded
   #   @return [String]
   #   @raise [DecompressError]
   #   @raise [OutputSizeLimitError]
@@ -78,7 +78,7 @@ module Zrip
 
 
     def decompress(bytes, max_output_size: nil)
-      _native_decompress(bytes, Integer(max_output_size || 0))
+      _native_decompress(bytes, max_output_size && Integer(max_output_size))
     end
   end
 end

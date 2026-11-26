@@ -3,7 +3,7 @@
 require_relative "dictionary"
 
 module Zrip
-  # Zstandard block-format codec.
+  # Zstandard codec for per-Ractor use.
   #
   # `BlockCodec` keeps mutable native context state and is intended to be used
   # per Ractor.
@@ -23,14 +23,14 @@ module Zrip
   #   @raise [CompressError]
   #
   # @!method compress(bytes)
-  #   Compress bytes to a Zstandard block.
+  #   Compress bytes to a Zstandard frame.
   #   @param bytes [String] uncompressed bytes
   #   @return [String]
   #   @raise [CompressError]
   #
   # @!method decompress(bytes, max_output_size: nil)
-  #   Decompress a Zstandard block.
-  #   @param bytes [String] compressed Zstandard block
+  #   Decompress a Zstandard frame.
+  #   @param bytes [String] compressed Zstandard frame
   #   @param max_output_size [Integer, nil] optional output byte limit
   #   @return [String]
   #   @raise [DecompressError]
@@ -38,8 +38,8 @@ module Zrip
   #
   # @!method _native_decompress(bytes, max_output_size)
   #   Native decompression entry used by #decompress.
-  #   @param bytes [String] compressed Zstandard block
-  #   @param max_output_size [Integer] output byte limit, or `0` for unbounded
+  #   @param bytes [String] compressed Zstandard frame
+  #   @param max_output_size [Integer, nil] output byte limit, or `nil` for unbounded
   #   @return [String]
   #   @raise [DecompressError]
   #   @raise [OutputSizeLimitError]
@@ -69,7 +69,7 @@ module Zrip
 
 
     def decompress(bytes, max_output_size: nil)
-      _native_decompress(bytes, Integer(max_output_size || 0))
+      _native_decompress(bytes, max_output_size && Integer(max_output_size))
     end
   end
 end

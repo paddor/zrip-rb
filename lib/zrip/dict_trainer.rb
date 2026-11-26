@@ -5,12 +5,14 @@ module Zrip
   #
   # @!method self.new(max_dict_size)
   #   Create a dictionary trainer.
-  #   @param max_dict_size [Integer] maximum dictionary size in bytes
+  #   @param max_dict_size [Integer] maximum dictionary size in bytes;
+  #     sizes under 256 count as 256
   #   @return [DictTrainer]
   #
   # @!method self._native_new(max_dict_size)
   #   Native constructor used by `.new`.
-  #   @param max_dict_size [Integer] maximum dictionary size in bytes
+  #   @param max_dict_size [Integer] maximum dictionary size in bytes;
+  #     sizes under 256 count as 256
   #   @return [DictTrainer]
   #
   # @!method add_sample(bytes)
@@ -32,7 +34,7 @@ module Zrip
   #   @return [Boolean]
   #
   # @!method max_dict_size
-  #   @return [Integer] configured maximum dictionary size
+  #   @return [Integer] maximum dictionary size, at least 256
   class DictTrainer
     def self.new(max_dict_size)
       _native_new(max_dict_size)

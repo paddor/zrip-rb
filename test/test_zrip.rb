@@ -81,7 +81,7 @@ describe Zrip::FrameCodec, "without a dictionary" do
   it "accepts explicit compression level" do
     c1 = Zrip::FrameCodec.new(level: -3)
     c3 = Zrip::FrameCodec.new(level: 4)
-    pt = ("X" * 100_000).b
+    pt = (1..20_000).map { |i| "line #{i} value=#{i * 7919 % 1000}\n" }.join.b
     refute_equal c1.compress(pt), c3.compress(pt)
     assert_equal pt, c1.decompress(c1.compress(pt))
     assert_equal pt, c3.decompress(c3.compress(pt))
@@ -203,6 +203,16 @@ describe "Zrip decompression limits" do
         codec.decompress(compressed, max_output_size: payload.bytesize - 1)
       end
       assert_equal payload, codec.decompress(compressed, max_output_size: payload.bytesize)
+    end
+  end
+
+
+  it "treats zero max output size as a limit" do
+    [Zrip::FrameCodec.new, Zrip::BlockCodec.new].each do |codec|
+      assert_equal "", codec.decompress(codec.compress(""), max_output_size: 0)
+      assert_raises(Zrip::OutputSizeLimitError) do
+        codec.decompress(codec.compress("a"), max_output_size: 0)
+      end
     end
   end
 
@@ -358,6 +368,27 @@ end
 describe Zrip::DictTrainer do
   def json_msg(i)
     %Q({"ts":"2026-04-27T12:00:00.#{format("%04d", i)}Z","level":"INFO","service":"api-gw","trace":"#{format("%08x", i)}","method":"GET","path":"/v1/users/#{format("%04d", i)}","status":200,"latency_ms":#{10 + i % 490},"region":"us-east-1"})
+  end
+
+
+  it "counts max dict size under 256 as 256" do
+    assert_equal 256, Zrip::DictTrainer.new(0).max_dict_size
+    assert_equal 256, Zrip::DictTrainer.new(255).max_dict_size
+    assert_equal 257, Zrip::DictTrainer.new(257).max_dict_size
+  end
+
+
+  it "trained dict fills max dict size" do
+    [0, 16, 255, 256, 257, 2048].each do |size|
+      t = Zrip::DictTrainer.new(size)
+      200.times { |i| t.add_sample(json_msg(i)) }
+      dict = t.train
+      assert_equal [size, 256].max, dict.bytesize, "size #{size}"
+
+      codec = Zrip::FrameCodec.new(dict: Zrip::Dictionary.new(bytes: dict))
+      msg   = json_msg(9999)
+      assert_equal msg, codec.decompress(codec.compress(msg))
+    end
   end
 
 
@@ -717,7 +748,7 @@ end
 
 
 describe "Zrip native interruptions" do
-  it "interrupted compression unlocks input and releases codec" do
+  it "interrupted compression releases codec and leaves input mutable" do
     interrupted_error = Class.new(StandardError)
     skip "requires MRI GVL" unless RUBY_ENGINE == "ruby"
 
@@ -732,7 +763,7 @@ describe "Zrip native interruptions" do
       worker.report_on_exception = false
 
       begin
-        assert wait_for_input_lock(input, worker), "compression did not lock input"
+        assert wait_without_gvl(worker), "compression did not release the GVL"
         worker.raise(interrupted_error)
         assert_instance_of interrupted_error, worker.value
         input.replace("usable")
@@ -746,7 +777,7 @@ describe "Zrip native interruptions" do
   end
 
 
-  it "killed compression unlocks input" do
+  it "killed compression leaves input mutable" do
     skip "requires MRI GVL" unless RUBY_ENGINE == "ruby"
 
     codec = Zrip::FrameCodec.new
@@ -754,7 +785,7 @@ describe "Zrip native interruptions" do
     worker = Thread.new { codec.compress(input) }
     worker.report_on_exception = false
     begin
-      assert wait_for_input_lock(input, worker), "compression did not lock input"
+      assert wait_without_gvl(worker), "compression did not release the GVL"
       worker.kill
       assert_nil worker.value
       input.replace("usable")
@@ -766,29 +797,49 @@ describe "Zrip native interruptions" do
   end
 
 
-  it "contended small compression locks input" do
+  it "compression without the GVL keeps the input it was given" do
     skip "requires MRI GVL" unless RUBY_ENGINE == "ruby"
 
     codec = Zrip::FrameCodec.new
     large_input = Random.bytes(128 * 1024 * 1024)
+    large_expected = large_input.byteslice(0, 4096)
     small_input = +"small mutable input"
+    small_expected = small_input.dup
     large_worker = Thread.new { codec.compress(large_input) }
     small_worker = nil
 
     begin
-      assert wait_for_input_lock(large_input, large_worker), "large compression did not lock input"
+      assert wait_without_gvl(large_worker), "large compression did not release the GVL"
       small_worker = Thread.new { codec.compress(small_input) }
-      assert wait_for_input_lock(small_input, small_worker), "contended small input was not locked"
-      assert_raises(RuntimeError) { small_input.replace("changed") }
-      small_compressed = small_worker.value
-      large_worker.value
-      assert_equal small_input, decompress(codec, small_compressed, small_input.bytesize)
-      small_input.replace("usable")
-      assert_equal "usable", small_input
+      assert wait_without_gvl(small_worker), "contended small compression did not release the GVL"
+      small_input.replace("changed")
+      large_input.bytesplice(0, 4096, "\0" * 4096)
+      assert_equal "changed", small_input
+      assert_equal small_expected, decompress(codec, small_worker.value, small_expected.bytesize)
+      large_output = decompress(codec, large_worker.value, large_input.bytesize)
+      assert_equal large_expected, large_output.byteslice(0, 4096)
     ensure
       [small_worker, large_worker].compact.each do |worker|
         worker.kill if worker.alive?
         worker.join
+      end
+    end
+  end
+
+
+  it "threads compress one mutable input at once" do
+    input = Random.bytes(4 * 1024 * 1024)
+    expected = input.dup
+    workers = 4.times.map do
+      Thread.new do
+        codec = Zrip::FrameCodec.new
+        3.times.map { codec.compress(input) }
+      end
+    end
+
+    workers.each do |worker|
+      worker.value.each do |compressed|
+        assert_equal expected, decompress(Zrip::FrameCodec.new, compressed, expected.bytesize)
       end
     end
   end
@@ -799,14 +850,11 @@ describe "Zrip native interruptions" do
     codec.decompress(compressed)
   end
 
-  def wait_for_input_lock(input, worker)
+  # A thread inside a native call without the GVL reports "sleep".
+  def wait_without_gvl(worker)
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
     while worker.alive? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-      begin
-        input.setbyte(0, input.getbyte(0))
-      rescue RuntimeError
-        return true
-      end
+      return true if worker.status == "sleep"
       Thread.pass
     end
     false

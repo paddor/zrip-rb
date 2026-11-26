@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-26
+
+- Update the `zrip` crate dependency to 0.8.29. Levels are retuned, so
+  compressed output differs from 0.2.1, and decoding rejects the frames C
+  zstd 1.6.0 rejects.
+- `DictTrainer#train` fills `max_dict_size`. Dictionaries came out 110-150
+  bytes short. Sizes under 256 now count as 256, and `max_dict_size`
+  returns the size used. They gave a dictionary of padding only.
+- Let several threads compress or decompress one mutable String at once.
+  Calls that release the GVL now borrow a frozen copy of the input instead
+  of locking it, so they no longer raise `RuntimeError` when another call
+  holds the same String, and the caller may modify it meanwhile.
+- `max_output_size: 0` now limits output to 0 bytes. It used to disable the
+  limit. Omit it or pass `nil` for no limit.
+- Fail on a bad first frame header without releasing the GVL.
+- Document that `BlockCodec` writes and reads Zstandard frames.
+
 ## [0.2.1] - 2026-10-11
 
 - Update the `zrip` crate dependency to 0.8.11 and `rb-sys` to 0.9.130.

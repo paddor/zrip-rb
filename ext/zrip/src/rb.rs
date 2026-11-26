@@ -7,13 +7,6 @@ use rb_sys::{rb_data_type_t, VALUE};
 pub type RbResult<T = VALUE> = Result<T, RubyErr>;
 
 #[cfg(ruby_engine = "mri")]
-unsafe extern "C" {
-    fn rb_obj_frozen_p(obj: VALUE) -> VALUE;
-    fn rb_str_locktmp(str: VALUE) -> VALUE;
-    fn rb_str_unlocktmp(str: VALUE) -> VALUE;
-}
-
-#[cfg(ruby_engine = "mri")]
 type RbWithoutGvlFunc = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 #[cfg(ruby_engine = "mri")]
 type RbUnblockFunc = unsafe extern "C" fn(*mut c_void);
@@ -185,7 +178,7 @@ where
         output: None,
     };
     // Ruby checks interrupts before and after the callback. Protect the call
-    // so an exception still drops native output and unlocks borrowed strings.
+    // so an exception still drops native output and borrowed strings.
     protect_unit(|| unsafe {
         rb_thread_call_without_gvl(
             Some(without_gvl_trampoline::<F, R>),
@@ -277,6 +270,14 @@ pub fn value_to_bytes(value: VALUE) -> RbResult<Vec<u8>> {
     bytes_from_string_value(string).map(|bytes| bytes.to_vec())
 }
 
+pub fn value_to_option_usize(value: VALUE) -> RbResult<Option<usize>> {
+    if value == qnil() {
+        Ok(None)
+    } else {
+        value_to_usize(value).map(Some)
+    }
+}
+
 pub fn value_to_option_bytes(value: VALUE) -> RbResult<Option<Vec<u8>>> {
     if value == qnil() {
         Ok(None)
@@ -306,14 +307,14 @@ impl InputBytes {
         self.as_slice().len()
     }
 
-    pub fn lock_for_without_gvl(&mut self, release_gvl: bool) -> RbResult<()> {
+    pub fn freeze_for_without_gvl(&mut self, release_gvl: bool) -> RbResult<()> {
         if !release_gvl {
             return Ok(());
         }
 
         match self {
             #[cfg(ruby_engine = "mri")]
-            Self::Borrowed(bytes) => bytes.lock_tmp(),
+            Self::Borrowed(bytes) => bytes.freeze(),
             #[cfg(not(ruby_engine = "mri"))]
             Self::Owned(_) => Ok(()),
         }
@@ -325,7 +326,7 @@ pub struct BorrowedStringBytes {
     value: VALUE,
     ptr: *const u8,
     len: usize,
-    locked: bool,
+    frozen: bool,
 }
 
 #[cfg(ruby_engine = "mri")]
@@ -337,7 +338,7 @@ impl BorrowedStringBytes {
             value: string,
             ptr: bytes.as_ptr(),
             len: bytes.len(),
-            locked: false,
+            frozen: false,
         })
     }
 
@@ -349,13 +350,20 @@ impl BorrowedStringBytes {
         }
     }
 
-    fn lock_tmp(&mut self) -> RbResult<()> {
-        if self.locked || unsafe { rb_obj_frozen_p(self.value) } == qtrue() {
+    // Borrow from a frozen copy before releasing the GVL. The copy shares the
+    // heap buffer, and a write to the caller's String copies that buffer first,
+    // so other threads may mutate or borrow the caller's String meanwhile.
+    fn freeze(&mut self) -> RbResult<()> {
+        if self.frozen {
             return Ok(());
         }
 
-        protect_value(|| unsafe { rb_str_locktmp(self.value) })?;
-        self.locked = true;
+        let frozen = protect_value(|| unsafe { rb_sys::rb_str_new_frozen(self.value) })?;
+        let bytes = bytes_from_string_value(frozen)?;
+        self.value = frozen;
+        self.ptr = bytes.as_ptr();
+        self.len = bytes.len();
+        self.frozen = true;
         Ok(())
     }
 }
@@ -363,11 +371,6 @@ impl BorrowedStringBytes {
 #[cfg(ruby_engine = "mri")]
 impl Drop for BorrowedStringBytes {
     fn drop(&mut self) {
-        if self.locked {
-            unsafe {
-                rb_str_unlocktmp(self.value);
-            }
-        }
         let _ = rb_sys::rb_gc_guard!(self.value);
     }
 }
@@ -414,6 +417,7 @@ pub fn value_to_u32(value: VALUE) -> RbResult<u32> {
     u32::try_from(value_to_usize(value)?).map_err(|_| RubyErr::arg("integer too large"))
 }
 
+#[allow(dead_code)]
 pub fn value_to_i32(value: VALUE) -> RbResult<i32> {
     let mut out = 0i64;
     protect_value(|| {
@@ -427,10 +431,12 @@ pub fn usize_value(value: usize) -> RbResult<VALUE> {
     protect_value(|| unsafe { rb_sys::rb_ull2inum(value as u64) })
 }
 
+#[allow(dead_code)]
 pub fn i32_value(value: i32) -> VALUE {
     unsafe { rb_sys::rb_int2inum(value as isize) }
 }
 
+#[allow(dead_code)]
 pub fn u64_option_value(value: Option<u64>) -> RbResult<VALUE> {
     match value {
         Some(value) => protect_value(|| unsafe { rb_sys::rb_ull2inum(value) }),
@@ -540,6 +546,7 @@ pub unsafe fn define_singleton_method_2(
     })
 }
 
+#[allow(dead_code)]
 pub unsafe fn define_singleton_method_3(
     object: VALUE,
     name: &CStr,
@@ -612,6 +619,7 @@ unsafe fn transmute_2(
     }
 }
 
+#[allow(dead_code)]
 unsafe fn transmute_3(
     func: unsafe extern "C" fn(VALUE, VALUE, VALUE, VALUE) -> VALUE,
 ) -> unsafe extern "C" fn() -> VALUE {
